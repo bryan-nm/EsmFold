@@ -3,12 +3,7 @@
 The public API is :class:`StructureScorer`.  Typical integration into a
 generative-model evaluation loop::
 
-    scorer = StructureScorer(
-        model_path="/models/ESMFold2-Fast",
-        device="xpu",              # or "cuda", "cpu", None for auto
-        num_sampling_steps=10,     # fewer steps = faster, good for ranking
-        num_loops=1,               # fewer recycling loops = faster
-    )
+    scorer = StructureScorer("/models/ESMFold2-Fast", device="xpu")
 
     # inside your eval callback:
     results = scorer.score(generated_sequences)
@@ -17,12 +12,9 @@ generative-model evaluation loop::
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -37,32 +29,22 @@ VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 class ScoringResult:
     """Container for pLDDT scoring results.
 
-    Attributes
-    ----------
-    mean_plddt:
-        Scalar mean pLDDT across all sequences (0–100 scale).
-    per_sequence_plddt:
-        Mean pLDDT for each input sequence, in order.
-    per_sequence_ptm:
-        pTM score for each input sequence, in order.
-    elapsed_seconds:
-        Wall-clock time for the scoring call.
-    num_sequences:
-        Number of sequences scored.
+    pLDDT and pTM are both on a **0–1** scale, as returned by ESMFold2.
+    Multiply by 100 for the 0–100 convention used by AlphaFold outputs.
     """
 
     mean_plddt: float
     per_sequence_plddt: list[float]
     per_sequence_ptm: list[float]
+    per_sequence_lengths: list[int]
     elapsed_seconds: float
     num_sequences: int
-    per_sequence_lengths: list[int] = field(default_factory=list)
 
 
 class StructureScorer:
     """Score protein sequences by predicted structural quality (mean pLDDT).
 
-    Wraps ESMFold2-Fast for fast, batched pLDDT evaluation.  Intended to be
+    Wraps ESMFold2-Fast for fast pLDDT evaluation.  Intended to be
     instantiated once and reused across many scoring calls.
 
     Parameters
@@ -70,46 +52,35 @@ class StructureScorer:
     model_path:
         Path to local ESMFold2-Fast weights directory (containing
         ``config.json`` and ``model.safetensors``), *or* a Hugging Face
-        Hub identifier like ``"biohub/ESMFold2-Fast"``.
+        Hub identifier like ``"biohub/ESMFold2-Fast"``.  The ESM-C 6B
+        backbone named in the config is resolved from the HuggingFace
+        cache; set ``HF_HUB_OFFLINE=1`` to resolve without network.
     device:
         ``"xpu"``, ``"cuda"``, ``"cpu"``, or ``None`` to auto-detect.
         Auto-detection prefers XPU > CUDA > CPU.
     dtype:
         Inference dtype.  ``None`` selects ``bfloat16`` on accelerators,
-        ``float32`` on CPU.  On XPU, the model weights are converted to
-        this dtype and ``F.linear`` / ``F.layer_norm`` are patched to
-        handle float32 inputs from the esm package's feature construction.
-    esmc_model_id:
-        HuggingFace Hub repo ID for the ESM-C backbone (e.g.
-        ``"biohub/ESMC-6B"``).  If ``None``, uses the default from the
-        ESMFold2-Fast config.  The backbone is resolved from the local
-        HuggingFace cache (``~/.cache/huggingface/hub/``) when
-        ``HF_HUB_OFFLINE=1`` is set — no network access needed.
+        ``float32`` on CPU.
     num_sampling_steps:
-        Diffusion sampling steps per structure prediction.  Default **10**
-        is ~5x faster than the paper default (50) and sufficient for
-        *relative* pLDDT ranking during training.  Increase for higher
-        absolute accuracy.
+        Diffusion sampling steps per structure prediction.  Default
+        **20**.  Do not lower this without re-benchmarking: output
+        quality collapses below ~20 steps rather than degrading
+        gracefully (see the benchmark table in the README).
     num_loops:
-        Folding-trunk recycling iterations.  Default **1** is fastest.
-        Paper default is 3.
+        Folding-trunk recycling iterations.  Default **1**.  Measured to
+        have no effect on pLDDT for typical sequences while costing
+        ~45% more wall-clock than the config default of 3.
     num_diffusion_samples:
         Structures sampled per sequence by the diffusion head.  Default
         **1**; the shipped config uses 32, which builds a structural
-        ensemble.  For pLDDT scoring the scores are averaged anyway, so
-        extra samples cost time and memory (pair tensors are ~L^2 each)
-        without changing the ranking.  ``None`` uses the config default.
-        Silently ignored if this build of `esm` does not accept it.
+        ensemble.  pLDDT is averaged over samples anyway, so extra
+        samples cost time and memory (pair tensors are ~L² each) without
+        changing the ranking.  ``None`` uses the config default.
     empty_cache_every:
         Release cached accelerator memory every N sequences.  Default
         **1** (after each).  Prevents allocator fragmentation across long
-        batches, which on Aurora XPU manifests as a GPU page fault.  Set
-        to ``0`` to disable if you are memory-comfortable and want the
-        last few percent of throughput.
-    compile_model:
-        If ``True``, run ``torch.compile()`` on the model after loading.
-        Adds ~30–60 s startup cost but can improve throughput for many
-        short sequences.  Requires PyTorch ≥ 2.1.
+        batches, which on Aurora XPU manifests as a GPU page fault rather
+        than a clean OOM.  Set ``0`` to disable.
     """
 
     def __init__(
@@ -118,12 +89,10 @@ class StructureScorer:
         *,
         device: str | None = None,
         dtype: torch.dtype | None = None,
-        esmc_model_id: str | None = None,
-        num_sampling_steps: int = 10,
+        num_sampling_steps: int = 20,
         num_loops: int = 1,
         num_diffusion_samples: int | None = 1,
         empty_cache_every: int = 1,
-        compile_model: bool = False,
     ) -> None:
         self.device = resolve_device(device)
         self.dtype = dtype or optimal_dtype(self.device)
@@ -132,9 +101,9 @@ class StructureScorer:
         self.num_diffusion_samples = num_diffusion_samples
         self.empty_cache_every = empty_cache_every
 
-        # Set False after the first TypeError so we stop retrying a kwarg
-        # this build of `esm` does not accept.
-        self._supports_diffusion_samples = num_diffusion_samples is not None
+        # Cleared if this build of `esm` rejects num_diffusion_samples,
+        # so we only pay for the failed call once.
+        self._pass_diffusion_samples = num_diffusion_samples is not None
 
         log.info(
             "Loading ESMFold2-Fast from %s (device=%s, dtype=%s)",
@@ -143,23 +112,11 @@ class StructureScorer:
             self.dtype,
         )
         t0 = time.monotonic()
-        self._model = self._load_model(model_path, esmc_model_id, compile_model)
+        self._model = self._load_model(model_path)
         log.info("Model loaded in %.1f s", time.monotonic() - t0)
 
-    def _load_model(
-        self,
-        model_path: str,
-        esmc_model_id: str | None,
-        compile_model: bool,
-    ) -> torch.nn.Module:
-        model_cls = self._resolve_model_class()
-        load_path = model_path
-
-        if esmc_model_id is not None:
-            log.info("Overriding ESM-C backbone to %s", esmc_model_id)
-            load_path = self._patch_config(model_path, esmc_model_id)
-
-        model = model_cls.from_pretrained(load_path)
+    def _load_model(self, model_path: str) -> torch.nn.Module:
+        model = self._resolve_model_class().from_pretrained(model_path)
         model = model.to(device=self.device, dtype=self.dtype).eval()
 
         if self.device.type == "xpu":
@@ -167,49 +124,29 @@ class StructureScorer:
             if self.dtype != torch.float32:
                 _patch_dtype_casting()
 
-        if compile_model:
-            log.info("Compiling model with torch.compile (this takes a while)...")
-            model = torch.compile(model)
-
         return model
 
     @staticmethod
-    def _patch_config(model_path: str, esmc_model_id: str) -> str:
-        """Create a temp directory with a modified config.json overriding esmc_id."""
-        config_file = os.path.join(model_path, "config.json")
-        with open(config_file) as f:
-            config_dict = json.load(f)
-        config_dict["esmc_id"] = esmc_model_id
-
-        tmp_dir = tempfile.mkdtemp(prefix="esmfold_scorer_")
-        for item in os.listdir(model_path):
-            src = os.path.join(model_path, item)
-            if os.path.isfile(src) and item != "config.json":
-                os.symlink(src, os.path.join(tmp_dir, item))
-        with open(os.path.join(tmp_dir, "config.json"), "w") as f:
-            json.dump(config_dict, f)
-        return tmp_dir
-
-    @staticmethod
     def _resolve_model_class() -> type:
-        # 1. Try the esm package (provides EsmFold2Model directly)
         try:
             from esm.models.esmfold2 import EsmFold2Model
+
             log.info("Using EsmFold2Model from esm package")
             return EsmFold2Model
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
-        # 2. Try transformers (may have it built-in in future versions)
+        # Newer transformers may ship ESMFold2 natively.
         try:
             from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+
             log.info("Using ESMFold2Model from transformers")
             return ESMFold2Model
-        except (ImportError, ModuleNotFoundError):
+        except ImportError:
             pass
 
         raise ImportError(
-            "Cannot find ESMFold2 model class. Install:\n"
+            "Cannot find the ESMFold2 model class. Install it with:\n"
             "  pip install 'esm @ git+https://github.com/Biohub/esm.git@main'"
         )
 
@@ -228,97 +165,90 @@ class StructureScorer:
         sequences:
             A single amino-acid string or a list of them.  Non-standard
             residues are replaced with ``X``.
-        num_sampling_steps:
-            Override the instance default for this call only.
-        num_loops:
-            Override the instance default for this call only.
+        num_sampling_steps, num_loops:
+            Override the instance defaults for this call only.
 
         Returns
         -------
         ScoringResult
-            Contains ``mean_plddt`` (scalar), ``per_sequence_plddt``
-            (list), ``per_sequence_ptm`` (list), and timing info.
+            pLDDT and pTM on a 0–1 scale, plus timing.
 
         Raises
         ------
         ValueError
-            If *sequences* is empty or contains only whitespace strings.
+            If *sequences* is empty, any entry is empty after
+            sanitization, or *steps* / *loops* are below 1.
         """
         if isinstance(sequences, str):
             sequences = [sequences]
         if not sequences:
             raise ValueError("sequences must be a non-empty list")
 
-        steps = num_sampling_steps if num_sampling_steps is not None else self.num_sampling_steps
-        loops = num_loops if num_loops is not None else self.num_loops
+        steps = self.num_sampling_steps if num_sampling_steps is None else num_sampling_steps
+        loops = self.num_loops if num_loops is None else num_loops
+        if steps < 1 or loops < 1:
+            raise ValueError("num_sampling_steps and num_loops must be >= 1")
 
         sequences = [self._sanitize(s) for s in sequences]
-        if any(len(s) == 0 for s in sequences):
+        if any(not s for s in sequences):
             raise ValueError("All sequences must be non-empty after sanitization")
 
         t0 = time.monotonic()
-        per_seq_plddt: list[float] = []
-        per_seq_ptm: list[float] = []
-        lengths: list[int] = []
+        plddt: list[float] = []
+        ptm: list[float] = []
 
         for i, seq in enumerate(sequences):
             output = self._infer(seq, loops=loops, steps=steps)
-            per_seq_plddt.append(float(output["plddt"].mean()))
-            per_seq_ptm.append(float(output["ptm"].mean()))
-            lengths.append(len(seq))
+            plddt.append(float(output["plddt"].mean()))
+            ptm.append(float(output["ptm"].mean()))
 
             # Structure prediction allocates large transient pair tensors
-            # (~L^2 per diffusion sample). Without releasing them the XPU
-            # caching allocator fragments across a long batch and faults.
+            # (~L² per diffusion sample). Releasing them keeps the XPU
+            # caching allocator from fragmenting across a long batch.
             del output
             if self.empty_cache_every and (i + 1) % self.empty_cache_every == 0:
-                _empty_cache(self.device)
+                empty_cache(self.device)
 
         elapsed = time.monotonic() - t0
-        mean_plddt = sum(per_seq_plddt) / len(per_seq_plddt)
+        mean_plddt = sum(plddt) / len(plddt)
 
         log.info(
-            "Scored %d sequence(s) in %.2f s — mean pLDDT: %.2f",
+            "Scored %d sequence(s) in %.2f s — mean pLDDT: %.4f",
             len(sequences),
             elapsed,
             mean_plddt,
         )
         return ScoringResult(
             mean_plddt=mean_plddt,
-            per_sequence_plddt=per_seq_plddt,
-            per_sequence_ptm=per_seq_ptm,
+            per_sequence_plddt=plddt,
+            per_sequence_ptm=ptm,
+            per_sequence_lengths=[len(s) for s in sequences],
             elapsed_seconds=elapsed,
             num_sequences=len(sequences),
-            per_sequence_lengths=lengths,
         )
 
     def _infer(self, seq: str, *, loops: int, steps: int) -> dict:
         """Run one structure prediction, adapting to this build's kwargs.
 
-        ``num_diffusion_samples`` controls how many structures the
-        diffusion head samples.  The shipped config uses 32, which is
-        useful for generating structural ensembles but wasteful for
-        scoring — pLDDT is averaged anyway, and peak memory scales with
-        it (pair tensors are ~L^2 per sample).  Not every build of `esm`
-        exposes it as a forward kwarg, so it is tried once and dropped
-        permanently if rejected.
+        ``infer_protein`` forwards ``**forward_kwargs`` straight through,
+        so an unsupported kwarg surfaces as a ``TypeError`` from
+        ``forward()`` rather than being rejected up front.  Match on the
+        kwarg name so unrelated ``TypeError``s still propagate.
         """
         kwargs = {"num_loops": loops, "num_sampling_steps": steps}
 
-        if self._supports_diffusion_samples:
+        if self._pass_diffusion_samples:
             try:
                 return self._model.infer_protein(
-                    seq,
-                    num_diffusion_samples=self.num_diffusion_samples,
-                    **kwargs,
+                    seq, num_diffusion_samples=self.num_diffusion_samples, **kwargs
                 )
             except TypeError as exc:
-                self._supports_diffusion_samples = False
+                if "num_diffusion_samples" not in str(exc):
+                    raise
+                self._pass_diffusion_samples = False
                 log.warning(
-                    "infer_protein() rejected num_diffusion_samples (%s); "
-                    "falling back to the config default. Peak memory will be "
-                    "higher on long sequences.",
-                    exc,
+                    "infer_protein() rejected num_diffusion_samples; using the "
+                    "config default. Peak memory will be higher on long sequences."
                 )
 
         return self._model.infer_protein(seq, **kwargs)
@@ -330,9 +260,9 @@ class StructureScorer:
         return "".join(c if c in VALID_AA else "X" for c in seq)
 
 
-def _empty_cache(device: torch.device) -> None:
+def empty_cache(device: torch.device) -> None:
     """Release cached allocator blocks on *device* (no-op on CPU)."""
-    if device.type == "xpu" and hasattr(torch, "xpu"):
+    if device.type == "xpu":
         torch.xpu.empty_cache()
     elif device.type == "cuda":
         torch.cuda.empty_cache()
@@ -340,7 +270,7 @@ def _empty_cache(device: torch.device) -> None:
 
 def peak_memory_gb(device: torch.device) -> float:
     """Peak allocator memory in GiB since the last reset (0.0 on CPU)."""
-    if device.type == "xpu" and hasattr(torch, "xpu"):
+    if device.type == "xpu":
         return torch.xpu.max_memory_allocated() / 1024**3
     if device.type == "cuda":
         return torch.cuda.max_memory_allocated() / 1024**3
@@ -352,58 +282,51 @@ def _patch_linalg_cpu_roundtrip() -> None:
 
     ``torch.linalg.svd`` has no XPU kernel, so PyTorch's aten dispatcher
     silently falls back to CPU ("Aten Op fallback from XPU to CPU").  That
-    automatic fallback corrupts GPU memory on Aurora's compute-runtime —
-    inference aborts with a GPU page fault ("Segmentation fault from GPU",
-    varying page-table levels) immediately after the fallback warning.
+    automatic fallback corrupts GPU memory on Aurora's compute-runtime:
+    inference aborts with "Segmentation fault from GPU" immediately after
+    the fallback warning.
 
-    Doing the device transfer ourselves — copy to CPU, compute in float32,
-    copy the result back — keeps the dispatcher out of the fallback path
-    and avoids the fault.  The tensors involved are per-residue 3x3
-    rotation matrices, so the round-trip cost is negligible.
+    Doing the transfer ourselves — copy to CPU, compute in float32, copy
+    back — keeps the dispatcher out of the fallback path.  The tensors are
+    per-residue 3x3 rotations, so the round-trip cost is negligible.
     """
     if getattr(torch.linalg.svd, "_xpu_patched", False):
         return
 
     _orig_svd = torch.linalg.svd
 
-    def _svd_cpu(A, full_matrices=True, **kwargs):
+    def svd(A, full_matrices=True, **kwargs):
         if A.is_xpu:
-            U, S, Vh = _orig_svd(
-                A.detach().to("cpu", torch.float32), full_matrices=full_matrices
-            )
-            return (
-                U.to(A.device, A.dtype),
-                S.to(A.device, A.dtype),
-                Vh.to(A.device, A.dtype),
+            cpu = A.detach().to("cpu", torch.float32)
+            return tuple(
+                t.to(A.device, A.dtype)
+                for t in _orig_svd(cpu, full_matrices=full_matrices)
             )
         return _orig_svd(A, full_matrices=full_matrices, **kwargs)
 
-    _svd_cpu._xpu_patched = True
-    torch.linalg.svd = _svd_cpu
-
     _orig_det = torch.linalg.det
 
-    def _det_cpu(A):
+    def det(A):
         if A.is_xpu:
-            return _orig_det(A.detach().to("cpu", torch.float32)).to(A.device, A.dtype)
+            cpu = A.detach().to("cpu", torch.float32)
+            return _orig_det(cpu).to(A.device, A.dtype)
         return _orig_det(A)
 
-    _det_cpu._xpu_patched = True
-    torch.linalg.det = _det_cpu
-
+    svd._xpu_patched = True
+    torch.linalg.svd = svd
+    torch.linalg.det = det
     log.info("Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)")
 
 
 def _patch_dtype_casting() -> None:
-    """Patch F.linear and F.layer_norm to cast inputs to match weight dtype.
+    """Cast float32 inputs to the weight dtype in F.linear / F.layer_norm.
 
-    The esm package's infer_protein creates float32 feature tensors
-    internally, but the model weights are bf16. On CUDA the esm package
-    uses torch.autocast to handle this; on XPU that autocast is disabled
-    (hardcoded to device_type="cuda"). These patches provide the same
-    dtype-matching behaviour without autocast, which avoids promoting
-    linalg ops (SVD, det) to bf16 — those ops lack bf16 XPU kernels and
-    crash the GPU driver when autocast forces them into bf16.
+    ``esm`` wraps its forward passes in ``torch.autocast(device_type="cuda")``,
+    which silently disables itself on XPU.  Model weights are bf16 but
+    ``infer_protein`` builds float32 feature tensors, so the two meet at a
+    dtype mismatch.  Patching just these two ops reproduces the dtype
+    matching autocast would have done, without promoting linalg ops to
+    bf16 — those lack bf16 XPU kernels and fault the GPU driver.
     """
     import torch.nn.functional as F
 
@@ -412,27 +335,21 @@ def _patch_dtype_casting() -> None:
 
     _orig_linear = F.linear
 
-    def _linear_match_dtype(input, weight, bias=None):
+    def linear(input, weight, bias=None):
         if input.is_floating_point() and input.dtype != weight.dtype:
             input = input.to(weight.dtype)
         if bias is not None and bias.dtype != weight.dtype:
             bias = bias.to(weight.dtype)
         return _orig_linear(input, weight, bias)
 
-    F.linear = _linear_match_dtype
-
     _orig_layer_norm = F.layer_norm
 
-    def _layer_norm_match_dtype(
-        input, normalized_shape, weight=None, bias=None, eps=1e-5
-    ):
-        if weight is not None and input.is_floating_point() and input.dtype != weight.dtype:
+    def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+        if weight is not None and input.dtype != weight.dtype:
             input = input.to(weight.dtype)
         return _orig_layer_norm(input, normalized_shape, weight, bias, eps)
 
-    F.layer_norm = _layer_norm_match_dtype
-
+    F.linear = linear
+    F.layer_norm = layer_norm
     F._xpu_dtype_patched = True
-    log.info(
-        "Patched F.linear and F.layer_norm for XPU bf16 dtype matching"
-    )
+    log.info("Patched F.linear and F.layer_norm for XPU bf16 dtype matching")

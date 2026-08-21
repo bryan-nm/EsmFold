@@ -10,8 +10,9 @@ sequences on-the-fly during training.
 Given one or more amino-acid sequences, `esmfold-scorer` runs ESMFold2-Fast
 (a single-sequence, diffusion-based structure prediction model) and returns:
 
-- **mean pLDDT** — per-sequence and overall, on the standard 0–100 scale.
-  Higher is better; ≥70 generally indicates a confident fold.
+- **mean pLDDT** — per-sequence and overall, on a **0–1** scale (multiply
+  by 100 for the AlphaFold convention).  Higher is better; ≳0.7 generally
+  indicates a confident fold.
 - **pTM** — predicted template modeling score (0–1).  Measures global
   structural accuracy.
 - **Timing** — wall-clock seconds, useful for throughput budgeting.
@@ -21,19 +22,49 @@ producing sequences that fold into well-defined 3D structures.
 
 ## Speed defaults
 
-The paper-default inference settings (50 diffusion steps, 3 recycling
-loops) maximize absolute accuracy.  For **relative ranking** during
-training — which is what an eval loop needs — fewer steps are sufficient:
+Defaults are **20 sampling steps, 1 recycling loop, 1 diffusion sample**,
+chosen from the benchmark below.  This is ~1.9× faster than the config
+defaults (50 steps, 3 loops) at statistically indistinguishable pLDDT.
 
-| Preset     | `num_sampling_steps` | `num_loops` | Relative speed |
-|------------|---------------------:|------------:|:--------------:|
-| Paper      |                   50 |           3 | 1×             |
-| Default    |                   10 |           1 | ~8–12×         |
-| Ultra-fast |                    5 |           1 | ~15–20×        |
+> **Do not lower `num_sampling_steps` below 20 without re-benchmarking.**
+> Quality does not degrade gracefully — it *collapses*.  See below.
 
-The ranking correlation between 10-step and 50-step pLDDT is high for
-typical generated sequences.  Start with the defaults and increase
-`num_sampling_steps` only if you need publication-quality absolute scores.
+### Benchmark
+
+100 SwissProt sequences (63–297 aa, mean 180), single Aurora PVC tile,
+bfloat16, `num_diffusion_samples=1`.  Model load ~30 s; 12.3 GiB resident,
+13.4 GiB peak.
+
+| steps | loops | mean pLDDT | s/seq | seq/s |
+|------:|------:|-----------:|------:|------:|
+|     5 |     1 |     0.2430 |  0.78 |  1.28 |
+|    10 |     1 |     0.2616 |  0.95 |  1.05 |
+| **20** | **1** | **0.8446** | **1.10** | **0.91** |
+|    50 |     1 |     0.8440 |  1.63 |  0.61 |
+|     5 |     3 |     0.2451 |  1.32 |  0.76 |
+|    10 |     3 |     0.2614 |  1.42 |  0.70 |
+|    20 |     3 |     0.8400 |  1.58 |  0.63 |
+|    50 |     3 |     0.8415 |  2.11 |  0.47 |
+
+Two things this measured:
+
+**Recycling loops do nothing here.** At every step count, `num_loops=3`
+matched `num_loops=1` to within 0.005 pLDDT while costing 40–45% more
+wall-clock.  Hence the default of 1.
+
+**Sampling steps have a cliff between 10 and 20.** The jump from 0.26 to
+0.84 is not convergence, it is a phase change: at 5–10 steps *every*
+sequence lands near 0.25, the no-information floor, so the scores carry no
+discriminative signal at all.  A generative-model eval loop running at 10
+steps would silently produce noise that looks like a plausible metric.
+Above 20, scores are converged (20 vs 50 differ by 0.0006).
+
+The cliff has not been localized more finely than 10–20 — the shipped
+`speed_test.pbs` sweeps 12/14/16/18 to pin it down.  Until then, note that
+the model config's own `inference_num_steps` is 14, suggesting the
+intended floor sits just below 20 and that the default has only modest
+headroom.  If you need to go faster, take it out of `num_diffusion_samples`
+or sequence count, not out of steps.
 
 ## Installation
 
@@ -66,11 +97,17 @@ pip install biopython biotite cloudpathlib zstd msgpack-numpy pygtrie tenacity b
 `transformers` ensures the venv gets its own copy (the frameworks module
 bundles an older version that would otherwise satisfy the requirement).
 
-**ESM-C backbone:** The ESM-C 6B backbone (~24 GB) must be cached in
+**ESM-C backbone:** The ESM-C 6B backbone must be cached in
 `~/.cache/huggingface/hub/` before running on compute nodes.  Download it
 once from a login node: `python -c "from huggingface_hub import snapshot_download; snapshot_download('biohub/ESMC-6B')"`.
 On compute nodes, set `HF_HUB_OFFLINE=1` so the Hub library resolves
 from cache without network access.
+
+The 6B backbone is **required** — it is not swappable for ESM-C 300M.
+ESMFold2-Fast's config hard-codes `lm_d_model: 2560` and
+`lm_num_layers: 80`, whereas ESMC-300M is `d_model: 960` / `n_layers: 30`.
+Loaded in bfloat16 it occupies 12.3 GiB, which fits comfortably on one
+Aurora PVC tile (64 GiB).
 
 ### Integrating into another project's environment
 
@@ -108,12 +145,12 @@ The first time you load the model, it needs:
 1. **ESMFold2-Fast weights** — 720 MB.  Point `model_path` to a local
    directory (containing `config.json` + `model.safetensors`), or use
    `"biohub/ESMFold2-Fast"` to download from HuggingFace Hub.
-2. **ESM-C 6B backbone** — ~24 GB.  Downloaded automatically by the
-   `esm` package on first load and cached in the HuggingFace cache
-   directory (`~/.cache/huggingface/hub/`).
+2. **ESM-C 6B backbone** — named by `esmc_id` in the ESMFold2-Fast config.
+   Downloaded automatically by the `esm` package on first load and cached
+   in `~/.cache/huggingface/hub/`.
 
 For HPC compute nodes without network access, pre-cache both weights
-from a login node and set `HF_HUB_OFFLINE=1` at runtime:
+from a login node and set `HF_HUB_OFFLINE=1` at runtime.
 
 ## Python API
 
@@ -125,24 +162,23 @@ from esmfold_scorer import StructureScorer
 scorer = StructureScorer("/path/to/ESMFold2-Fast")
 results = scorer.score(["MQIFVKTLTGKTITLEVEPSDTIENVKAK"])
 
-print(results.mean_plddt)          # e.g. 82.5
-print(results.per_sequence_plddt)  # [82.5]
-print(results.per_sequence_ptm)    # [0.87]
-print(results.elapsed_seconds)     # 1.23
+print(results.mean_plddt)          # e.g. 0.8446  (0–1 scale)
+print(results.per_sequence_plddt)  # [0.8446]
+print(results.per_sequence_ptm)    # [0.8712]
+print(results.elapsed_seconds)     # 1.10
 ```
 
 ### Integration into a training eval loop
 
 ```python
-import torch
 from esmfold_scorer import StructureScorer
 
 # --- once, at eval setup ---
+# Loading takes ~30 s and holds 12.3 GiB, so build the scorer once and
+# reuse it; do not construct one per eval step.
 scorer = StructureScorer(
     model_path="/models/ESMFold2-Fast",
-    device="xpu",              # auto-detects if None
-    num_sampling_steps=10,     # fast defaults
-    num_loops=1,
+    device="xpu",          # auto-detects if None
 )
 
 # --- inside your eval callback ---
@@ -164,23 +200,21 @@ def evaluate_generated_sequences(sequences: list[str]) -> dict:
 | `model_path`          | `"biohub/ESMFold2-Fast"`   | Local weights directory or HuggingFace Hub id.                        |
 | `device`              | `None` (auto)              | `"xpu"`, `"cuda"`, `"cpu"`, or `None` for auto-detect.               |
 | `dtype`               | `None` (auto)              | `bfloat16` on accelerators, `float32` on CPU.                         |
-| `esmc_model_id`       | `None`                     | Hub repo ID for ESM-C backbone. `None` uses config default.           |
-| `num_sampling_steps`  | `10`                       | Diffusion steps. Lower = faster. Paper default: 50.                   |
-| `num_loops`           | `1`                        | Trunk recycling loops. Lower = faster. Paper default: 3.              |
+| `num_sampling_steps`  | `20`                       | Diffusion steps. **Do not lower** — quality collapses below ~20.      |
+| `num_loops`           | `1`                        | Trunk recycling loops. Measured to have no effect on pLDDT.           |
 | `num_diffusion_samples` | `1`                      | Structures sampled per sequence. Config default 32. Drives peak memory. |
 | `empty_cache_every`   | `1`                        | Release cached device memory every N sequences. `0` disables.         |
-| `compile_model`       | `False`                    | Run `torch.compile()`. Slow startup, faster steady-state throughput.  |
 
 ### ScoringResult fields
 
-| Field                   | Type          | Description                                     |
-|-------------------------|---------------|-------------------------------------------------|
-| `mean_plddt`            | `float`       | Scalar mean pLDDT across all sequences (0–100). |
-| `per_sequence_plddt`    | `list[float]` | Mean pLDDT for each input sequence.             |
-| `per_sequence_ptm`      | `list[float]` | pTM for each input sequence (0–1).              |
-| `per_sequence_lengths`  | `list[int]`   | Residue count for each input sequence.          |
-| `elapsed_seconds`       | `float`       | Wall-clock time for the scoring call.           |
-| `num_sequences`         | `int`         | Number of sequences scored.                     |
+| Field                   | Type          | Description                                      |
+|-------------------------|---------------|--------------------------------------------------|
+| `mean_plddt`            | `float`       | Mean pLDDT across all sequences (**0–1** scale).  |
+| `per_sequence_plddt`    | `list[float]` | Mean pLDDT for each input sequence (0–1).        |
+| `per_sequence_ptm`      | `list[float]` | pTM for each input sequence (0–1).               |
+| `per_sequence_lengths`  | `list[int]`   | Residue count for each input sequence.           |
+| `elapsed_seconds`       | `float`       | Wall-clock time for the scoring call.            |
+| `num_sequences`         | `int`         | Number of sequences scored.                      |
 
 ## CLI
 
@@ -197,8 +231,8 @@ cat seqs.txt | esmfold-score -m /models/ESMFold2-Fast --stdin
 # JSON output for programmatic consumption
 esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --json
 
-# Faster with fewer steps
-esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --steps 5 --loops 1
+# Higher-accuracy settings (slower, matches the model config defaults)
+esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --steps 50 --loops 3
 
 # Offline mode (resolve all models from HuggingFace cache)
 HF_HUB_OFFLINE=1 esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta
@@ -254,8 +288,9 @@ are applied automatically when `device` resolves to `xpu`:
 ## Speed test (Aurora)
 
 A PBS job script and 100-sequence FASTA file are included for
-benchmarking on Aurora.  The script sweeps step/loop configurations
-and reports throughput:
+benchmarking on Aurora.  The script loads the model once, smoke-tests the
+longest sequence, then sweeps step/loop configurations reporting pLDDT,
+throughput and peak memory:
 
 ```bash
 qsub speed_test.pbs
@@ -263,6 +298,11 @@ qsub speed_test.pbs
 
 Edit the paths at the top of `speed_test.pbs` if your weight / env
 locations differ.  Results go to the job's `.o` file.
+
+To audit which aten ops silently fall back from XPU to CPU — worth
+checking after an `esm` or PyTorch upgrade, since a *new* linalg fallback
+would reintroduce the GPU page fault described above — add
+`export PYTORCH_DEBUG_XPU_FALLBACK=1` to the script.
 
 ## Project structure
 
@@ -282,21 +322,25 @@ EsmFold/
 
 ## Tuning for your workload
 
-**Short sequences (< 100 residues):** `torch.compile()` amortizes well.
-Pass `compile_model=True` if you're scoring hundreds of short peptides.
+**Budgeting an eval step:** at the defaults, expect ~1.1 s/sequence on one
+Aurora tile for 63–297 aa inputs, plus a one-time ~30 s model load.  A
+256-sequence eval batch is therefore ~4.5 minutes.  Cost is dominated by
+sequence count, not length — the 297 aa smoke test and the 100-sequence
+mean both land near 1.1 s.
 
-**Long sequences (> 500 residues):** Memory dominates, and it scales as
-roughly `num_diffusion_samples × L²`.  Keep `num_diffusion_samples=1`
-(the default here, vs. 32 in the shipped config) and `num_sampling_steps`
-low.  On CUDA, `dtype=torch.float16` is an option if bf16 causes OOM.
-If you see a GPU page fault rather than a clean OOM on XPU, that is the
-allocator fragmenting — lower `empty_cache_every` or drop the sample
-count before assuming the sequence is too long.
+**Long sequences (> 500 residues):** Memory scales as roughly
+`num_diffusion_samples × L²`.  Keep `num_diffusion_samples=1` (the default
+here, vs. 32 in the shipped config).  On CUDA, `dtype=torch.float16` is an
+option if bf16 causes OOM.  If you see a GPU page fault rather than a
+clean OOM on XPU, that is the allocator fragmenting — check
+`empty_cache_every` and the sample count before assuming the sequence is
+too long.
 
-**Very large batches:** Sequences are scored one at a time (ESMFold2's
-`infer_protein` is single-sequence).  Throughput scales linearly with
-sequence count.  For maximum GPU utilization on short sequences, consider
-running multiple scorer processes.
+**Very large batches:** Sequences are scored one at a time — ESMFold2's
+`infer_protein` takes a single sequence, so there is no intra-batch
+parallelism to exploit.  Throughput scales linearly with sequence count.
+For better device utilization, run multiple scorer processes on separate
+tiles (`ZE_AFFINITY_MASK`) rather than looking for a batch API.
 
 ## License
 

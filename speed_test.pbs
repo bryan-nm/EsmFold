@@ -12,7 +12,7 @@
 
 # ---------------------------------------------------------------------------
 # Speed test: score 100 SwissProt sequences at several step/loop configs.
-# Single-node, single-tile inference — loads model ONCE, then sweeps.
+# Single-node, single-tile inference — loads the model ONCE, then sweeps.
 # ---------------------------------------------------------------------------
 
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
@@ -21,7 +21,7 @@ set -eo pipefail
 module load frameworks
 
 # ---------------------------------------------------------------------------
-# Environment — uses a dedicated venv layered on top of the frameworks module.
+# Environment — a dedicated venv layered on the frameworks module.
 # To create it (once, from a login node):
 #
 #   module load frameworks
@@ -31,13 +31,10 @@ module load frameworks
 #   pip install --no-deps 'esm @ git+https://github.com/Biohub/esm.git@main'
 #   pip install biopython biotite cloudpathlib zstd msgpack-numpy pygtrie tenacity brotli
 #
-# --system-site-packages inherits torch, ipex, oneCCL, etc. from the
-# frameworks module.  --no-deps on esm prevents it from pulling a PyPI
-# CUDA torch build that would shadow the system XPU torch.
-#
-# IMPORTANT: transformers must be force-installed so the venv has its
-# own copy (pip may skip it if the system version looks sufficient):
-#   pip install --ignore-installed 'transformers>=4.57'
+# --system-site-packages inherits torch, ipex and oneCCL from the frameworks
+# module. --no-deps on esm stops it pulling a PyPI CUDA torch that would
+# shadow the system XPU build. --ignore-installed on transformers forces a
+# venv-local copy (pip would otherwise accept the older system version).
 # ---------------------------------------------------------------------------
 source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
 
@@ -45,14 +42,8 @@ export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export HF_HUB_OFFLINE=1
 
-# Enumerate any aten ops silently falling back XPU -> CPU. Those fallbacks
-# are both a performance cliff and (for linalg ops) a source of GPU page
-# faults on Aurora's compute-runtime; the scorer patches the known ones.
-export PYTORCH_DEBUG_XPU_FALLBACK=1
-
-# The frameworks module prepends its site-packages to PYTHONPATH, which
-# shadows venv-installed packages (like our newer transformers). Fix by
-# putting the venv's site-packages first.
+# The frameworks module prepends its site-packages to PYTHONPATH, shadowing
+# venv-installed packages. Put the venv's site-packages first.
 VENV_SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 export PYTHONPATH="${VENV_SITE}:${PBS_O_WORKDIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -77,11 +68,10 @@ echo "  HF_HUB_OFFLINE: ${HF_HUB_OFFLINE}"
 echo "  fasta         : ${FASTA} ($(grep -c '^>' ${FASTA}) sequences)"
 echo "  python        : $(which python)"
 echo "  torch         : $(python -c 'import torch; print(torch.__version__)')"
-echo "  ipex          : $(python -c 'import intel_extension_for_pytorch; print(intel_extension_for_pytorch.__version__)' 2>/dev/null || echo 'not installed')"
-echo "  transformers  : $(python -c 'import transformers; print(transformers.__version__, transformers.__file__)')"
-echo "  esm           : $(python -c 'import esm; print(esm.__version__, esm.__file__)' 2>/dev/null || echo 'not installed')"
-echo "  esmfold2 model: $(python -c 'from esm.models.esmfold2 import EsmFold2Model; print("available")' 2>&1)"
-echo "  xpu devices   : $(python -c 'import torch; import intel_extension_for_pytorch; print(torch.xpu.device_count())' 2>/dev/null || echo 'N/A')"
+echo "  ipex          : $(python -c 'import intel_extension_for_pytorch as x; print(x.__version__)' 2>/dev/null || echo 'not installed')"
+echo "  transformers  : $(python -c 'import transformers; print(transformers.__version__)')"
+echo "  esm           : $(python -c 'import esm; print(esm.__version__)' 2>/dev/null || echo 'not installed')"
+echo "  xpu devices   : $(python -c 'import torch, intel_extension_for_pytorch; print(torch.xpu.device_count())' 2>/dev/null || echo 'N/A')"
 echo "================================================================"
 echo ""
 
@@ -92,89 +82,49 @@ python - "${ESMFOLD_WEIGHTS}" "${FASTA}" <<'PYEOF'
 import sys
 import time
 
-model_path, fasta_path = sys.argv[1], sys.argv[2]
-
-# --- parse FASTA ---
-sequences = []
-with open(fasta_path) as f:
-    header, chunks = "", []
-    for line in f:
-        line = line.strip()
-        if line.startswith(">"):
-            if chunks:
-                sequences.append("".join(chunks))
-            header = line
-            chunks = []
-        elif line:
-            chunks.append(line)
-    if chunks:
-        sequences.append("".join(chunks))
-
-print(f"Loaded {len(sequences)} sequences "
-      f"({min(len(s) for s in sequences)}-{max(len(s) for s in sequences)} aa)\n")
-
-# --- load model once ---
-import inspect
 import torch
+
 from esmfold_scorer import StructureScorer
+from esmfold_scorer.cli import parse_fasta
 from esmfold_scorer.scorer import peak_memory_gb
 
+model_path, fasta_path = sys.argv[1], sys.argv[2]
+
+sequences = [seq for _, seq in parse_fasta(fasta_path)]
+print(f"Loaded {len(sequences)} sequences "
+      f"({min(map(len, sequences))}-{max(map(len, sequences))} aa)\n")
+
 t_load = time.monotonic()
-scorer = StructureScorer(
-    model_path=model_path,
-    device="xpu",
-)
-t_load = time.monotonic() - t_load
-print(f"Model loaded in {t_load:.1f} s")
-print(f"Weights resident: {peak_memory_gb(scorer.device):.1f} GiB\n")
+scorer = StructureScorer(model_path=model_path, device="xpu")
+print(f"Model loaded in {time.monotonic() - t_load:.1f} s "
+      f"({peak_memory_gb(scorer.device):.1f} GiB resident)\n")
 
-# --- diagnostic: what kwargs does this build of esm accept? ---
-try:
-    print(f"infer_protein{inspect.signature(scorer._model.infer_protein)}\n")
-except (TypeError, ValueError) as exc:
-    print(f"(could not introspect infer_protein: {exc})\n")
+# Smoke test on the memory worst case before committing to the full sweep.
+longest = max(sequences, key=len)
+print(f"[smoke] {len(longest)} aa ...", end=" ", flush=True)
+t = time.monotonic()
+smoke = scorer.score([longest], num_sampling_steps=20, num_loops=1)
+print(f"OK  pLDDT={smoke.mean_plddt:.4f}  {time.monotonic() - t:.1f}s\n",
+      flush=True)
 
+# Step counts are clustered around 10-20: quality collapses somewhere in
+# that range (0.26 -> 0.84) rather than degrading gradually, and the exact
+# cliff location sets how much headroom the 20-step default really has.
+configs = [(n, 1) for n in (5, 10, 12, 14, 16, 18, 20, 25, 50)]
+configs += [(20, 3), (50, 3)]  # confirm recycling loops still don't matter
 
-def probe(label, seq, steps, loops):
-    """Score one sequence, reporting time, pLDDT range and peak memory."""
-    torch.xpu.reset_peak_memory_stats()
-    print(f"[{label}] {len(seq)} aa, {steps} steps, {loops} loop(s)...",
-          end=" ", flush=True)
-    t = time.monotonic()
-    r = scorer.score([seq], num_sampling_steps=steps, num_loops=loops)
-    print(f"OK  pLDDT={r.mean_plddt:.4f}  pTM={r.per_sequence_ptm[0]:.4f}  "
-          f"{time.monotonic() - t:.1f}s  peak={peak_memory_gb(scorer.device):.1f} GiB",
-          flush=True)
-    return r
-
-
-# --- staged smoke tests, cheapest first ---
-# The full sweep crashed after the short-sequence smoke test passed, so
-# probe the memory worst case (longest sequence at the heaviest config)
-# BEFORE committing to 100 sequences. Each stage fails fast and tells us
-# where the ceiling is instead of aborting mid-sweep.
-by_len = sorted(sequences, key=len)
-probe("smoke:short", by_len[0], 2, 1)
-probe("smoke:long", by_len[-1], 2, 1)
-probe("smoke:long-heavy", by_len[-1], 50, 3)
-print()
-
-# --- sweep configs ---
-configs = [
-    (5, 1), (10, 1), (20, 1), (50, 1),
-    (5, 3), (10, 3), (20, 3), (50, 3),
-]
-
-print(f"{'steps':>5}  {'loops':>5}  {'pLDDT':>8}  {'time (s)':>9}  {'seq/s':>7}  {'s/seq':>7}  {'peak GiB':>8}")
-print("-" * 68)
+print(f"{'steps':>5}  {'loops':>5}  {'pLDDT':>8}  {'pTM':>7}  "
+      f"{'time (s)':>9}  {'seq/s':>7}  {'s/seq':>7}  {'peak GiB':>8}")
+print("-" * 78)
 
 for steps, loops in configs:
     torch.xpu.reset_peak_memory_stats()
-    result = scorer.score(sequences, num_sampling_steps=steps, num_loops=loops)
-    n, t = result.num_sequences, result.elapsed_seconds
-    print(f"{steps:>5}  {loops:>5}  {result.mean_plddt:>8.4f}  {t:>9.1f}  "
-          f"{n/t:>7.2f}  {t/n:>7.2f}  {peak_memory_gb(scorer.device):>8.1f}",
-          flush=True)
+    r = scorer.score(sequences, num_sampling_steps=steps, num_loops=loops)
+    mean_ptm = sum(r.per_sequence_ptm) / r.num_sequences
+    print(f"{steps:>5}  {loops:>5}  {r.mean_plddt:>8.4f}  {mean_ptm:>7.4f}  "
+          f"{r.elapsed_seconds:>9.1f}  {r.num_sequences / r.elapsed_seconds:>7.2f}  "
+          f"{r.elapsed_seconds / r.num_sequences:>7.2f}  "
+          f"{peak_memory_gb(scorer.device):>8.1f}", flush=True)
 
 print()
 PYEOF
