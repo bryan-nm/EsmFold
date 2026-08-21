@@ -146,30 +146,27 @@ class StructureScorer:
 
     @staticmethod
     def _resolve_classes() -> tuple[type, type]:
-        # 1. Try transformers >= 4.57 (has esmfold2 built-in)
+        # 1. Try the esm package (provides EsmFold2Model directly)
+        try:
+            from esm.models.esmfold2 import EsmFold2Model
+            from esm.models.esmfold2.config import EsmFold2Config
+            log.info("Using EsmFold2Model from esm package")
+            return EsmFold2Model, EsmFold2Config
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # 2. Try transformers (may have it built-in in future versions)
         try:
             from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
             from transformers.models.esmfold2.configuration_esmfold2 import ESMFold2Config
-            log.info("Using ESMFold2 from transformers")
+            log.info("Using ESMFold2Model from transformers")
             return ESMFold2Model, ESMFold2Config
         except (ImportError, ModuleNotFoundError):
             pass
 
-        # 2. Try the esm package (registers model with transformers on import)
-        try:
-            import esm  # noqa: F401 — triggers model registration
-            from transformers import AutoModel, AutoConfig
-            AutoConfig.from_pretrained.__func__  # just verify it's callable
-            log.info("Using ESMFold2 via esm package registration")
-            return AutoModel, AutoConfig
-        except (ImportError, ModuleNotFoundError):
-            pass
-
         raise ImportError(
-            "Cannot find ESMFold2 model class. Install either:\n"
-            "  pip install 'transformers>=4.57'          (has esmfold2 built-in)\n"
-            "  pip install 'esm @ git+https://github.com/Biohub/esm.git@main'\n"
-            "    (registers esmfold2 with transformers at import time)"
+            "Cannot find ESMFold2 model class. Install:\n"
+            "  pip install 'esm @ git+https://github.com/Biohub/esm.git@main'"
         )
 
     @torch.inference_mode()
