@@ -56,13 +56,21 @@ the system's XPU torch:
 module load frameworks
 python -m venv /path/to/esmfold-env --system-site-packages
 source /path/to/esmfold-env/bin/activate
-pip install 'transformers>=4.57'
+pip install --ignore-installed 'transformers>=4.57'
 pip install --no-deps 'esm @ git+https://github.com/Biohub/esm.git@main'
-pip install biopython biotite cloudpathlib   # esm's non-torch runtime deps
+pip install biopython biotite cloudpathlib zstd msgpack-numpy pygtrie tenacity brotli
 ```
 
 `--system-site-packages` inherits `torch`, `intel_extension_for_pytorch`,
-`oneCCL`, etc. from the frameworks module.
+`oneCCL`, etc. from the frameworks module.  `--ignore-installed` on
+`transformers` ensures the venv gets its own copy (the frameworks module
+bundles an older version that would otherwise satisfy the requirement).
+
+**ESM-C backbone:** The ESM-C 6B backbone (~24 GB) must be cached in
+`~/.cache/huggingface/hub/` before running on compute nodes.  Download it
+once from a login node: `python -c "from huggingface_hub import snapshot_download; snapshot_download('biohub/ESMC-6B')"`.
+On compute nodes, set `HF_HUB_OFFLINE=1` so the Hub library resolves
+from cache without network access.
 
 ### Integrating into another project's environment
 
@@ -104,17 +112,8 @@ The first time you load the model, it needs:
    `esm` package on first load and cached in the HuggingFace cache
    directory (`~/.cache/huggingface/hub/`).
 
-For air-gapped or HPC environments, pre-download both and point to local
-paths.  Use the `esmc_model_path` parameter (or `--esmc-path` on the CLI)
-to redirect the backbone load to a local directory instead of downloading
-from HuggingFace Hub:
-
-```python
-scorer = StructureScorer(
-    model_path="/flare/models/ESMFold2-Fast",
-    esmc_model_path="~/.cache/huggingface/hub/models--biohub--ESMC-6B/",
-)
-```
+For HPC compute nodes without network access, pre-cache both weights
+from a login node and set `HF_HUB_OFFLINE=1` at runtime:
 
 ## Python API
 
@@ -165,7 +164,7 @@ def evaluate_generated_sequences(sequences: list[str]) -> dict:
 | `model_path`          | `"biohub/ESMFold2-Fast"`   | Local weights directory or HuggingFace Hub id.                        |
 | `device`              | `None` (auto)              | `"xpu"`, `"cuda"`, `"cpu"`, or `None` for auto-detect.               |
 | `dtype`               | `None` (auto)              | `bfloat16` on accelerators, `float32` on CPU. Override if needed.     |
-| `esmc_model_path`     | `None`                     | Local ESM-C backbone path. `None` downloads from Hub.                 |
+| `esmc_model_id`       | `None`                     | Hub repo ID for ESM-C backbone. `None` uses config default.           |
 | `num_sampling_steps`  | `10`                       | Diffusion steps. Lower = faster. Paper default: 50.                   |
 | `num_loops`           | `1`                        | Trunk recycling loops. Lower = faster. Paper default: 3.              |
 | `compile_model`       | `False`                    | Run `torch.compile()`. Slow startup, faster steady-state throughput.  |
@@ -199,9 +198,8 @@ esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --json
 # Faster with fewer steps
 esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --steps 5 --loops 1
 
-# Point to a local ESM-C backbone (avoids HuggingFace download)
-esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta \
-    --esmc-path ~/.cache/huggingface/hub/models--biohub--ESMC-6B/
+# Offline mode (resolve all models from HuggingFace cache)
+HF_HUB_OFFLINE=1 esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta
 
 # Verbose logging (model load times, per-batch info)
 esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta -v

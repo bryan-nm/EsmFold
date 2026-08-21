@@ -71,10 +71,11 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser.add_argument(
-        "--esmc-path",
+        "--esmc-id",
         default=None,
-        help="Path to local ESM-C backbone weights (avoids downloading "
-             "biohub/ESMC-6B from HuggingFace Hub).",
+        help="HuggingFace Hub repo ID for the ESM-C backbone "
+             "(default: from ESMFold2-Fast config, usually biohub/ESMC-6B). "
+             "Set HF_HUB_OFFLINE=1 to resolve from cache without network.",
     )
     parser.add_argument(
         "--device",
@@ -142,7 +143,7 @@ def main(argv: list[str] | None = None) -> None:
     scorer = StructureScorer(
         model_path=args.model_path,
         device=args.device,
-        esmc_model_path=args.esmc_path,
+        esmc_model_id=args.esmc_id,
         num_sampling_steps=args.steps,
         num_loops=args.loops,
         compile_model=args.compile,

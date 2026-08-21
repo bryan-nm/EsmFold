@@ -43,6 +43,7 @@ source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
 
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export HF_HUB_OFFLINE=1
 
 # The frameworks module prepends its site-packages to PYTHONPATH, which
 # shadows venv-installed packages (like our newer transformers). Fix by
@@ -54,7 +55,6 @@ export PYTHONPATH="${VENV_SITE}:${PBS_O_WORKDIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 # Paths — edit these if your layout differs
 # ---------------------------------------------------------------------------
 ESMFOLD_WEIGHTS="/flare/NLDesignProtein/bryan/models/ESMFold2-Fast"
-ESMC_BACKBONE="${HOME}/.cache/huggingface/hub/models--biohub--ESMC-6B/"
 FASTA="test_sequences.fasta"
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ echo "  started       : $(date '+%Y-%m-%dT%H:%M:%S%z')"
 echo "  user@host     : $(whoami)@$(hostname)"
 echo "  repo          : $(pwd)"
 echo "  weights       : ${ESMFOLD_WEIGHTS}"
-echo "  esmc backbone : ${ESMC_BACKBONE}"
+echo "  HF_HUB_OFFLINE: ${HF_HUB_OFFLINE}"
 echo "  fasta         : ${FASTA} ($(grep -c '^>' ${FASTA}) sequences)"
 echo "  python        : $(which python)"
 echo "  torch         : $(python -c 'import torch; print(torch.__version__)')"
@@ -83,11 +83,11 @@ echo ""
 # ---------------------------------------------------------------------------
 # Run: load model once, sweep step/loop configs
 # ---------------------------------------------------------------------------
-python - "${ESMFOLD_WEIGHTS}" "${ESMC_BACKBONE}" "${FASTA}" <<'PYEOF'
+python - "${ESMFOLD_WEIGHTS}" "${FASTA}" <<'PYEOF'
 import sys
 import time
 
-model_path, esmc_path, fasta_path = sys.argv[1], sys.argv[2], sys.argv[3]
+model_path, fasta_path = sys.argv[1], sys.argv[2]
 
 # --- parse FASTA ---
 sequences = []
@@ -114,7 +114,6 @@ from esmfold_scorer import StructureScorer
 t_load = time.monotonic()
 scorer = StructureScorer(
     model_path=model_path,
-    esmc_model_path=esmc_path,
     device="xpu",
 )
 t_load = time.monotonic() - t_load

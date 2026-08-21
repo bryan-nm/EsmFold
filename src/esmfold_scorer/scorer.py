@@ -77,12 +77,12 @@ class StructureScorer:
     dtype:
         Inference dtype.  ``None`` selects ``bfloat16`` on accelerators,
         ``float32`` on CPU.
-    esmc_model_path:
-        Path to a local ESM-C backbone weights directory.  If ``None``,
-        the ``esm`` package downloads the backbone specified in the
-        ESMFold2-Fast config (``biohub/ESMC-6B``) from HuggingFace Hub.
-        Set this to avoid network access on air-gapped nodes or to use
-        a pre-cached copy.
+    esmc_model_id:
+        HuggingFace Hub repo ID for the ESM-C backbone (e.g.
+        ``"biohub/ESMC-6B"``).  If ``None``, uses the default from the
+        ESMFold2-Fast config.  The backbone is resolved from the local
+        HuggingFace cache (``~/.cache/huggingface/hub/``) when
+        ``HF_HUB_OFFLINE=1`` is set — no network access needed.
     num_sampling_steps:
         Diffusion sampling steps per structure prediction.  Default **10**
         is ~5x faster than the paper default (50) and sufficient for
@@ -103,7 +103,7 @@ class StructureScorer:
         *,
         device: str | None = None,
         dtype: torch.dtype | None = None,
-        esmc_model_path: str | None = None,
+        esmc_model_id: str | None = None,
         num_sampling_steps: int = 10,
         num_loops: int = 1,
         compile_model: bool = False,
@@ -120,21 +120,21 @@ class StructureScorer:
             self.dtype,
         )
         t0 = time.monotonic()
-        self._model = self._load_model(model_path, esmc_model_path, compile_model)
+        self._model = self._load_model(model_path, esmc_model_id, compile_model)
         log.info("Model loaded in %.1f s", time.monotonic() - t0)
 
     def _load_model(
         self,
         model_path: str,
-        esmc_model_path: str | None,
+        esmc_model_id: str | None,
         compile_model: bool,
     ) -> torch.nn.Module:
         model_cls = self._resolve_model_class()
         load_path = model_path
 
-        if esmc_model_path is not None:
-            log.info("Overriding ESM-C backbone path to %s", esmc_model_path)
-            load_path = self._patch_config(model_path, esmc_model_path)
+        if esmc_model_id is not None:
+            log.info("Overriding ESM-C backbone to %s", esmc_model_id)
+            load_path = self._patch_config(model_path, esmc_model_id)
 
         model = model_cls.from_pretrained(load_path)
         model = model.to(device=self.device, dtype=self.dtype).eval()
@@ -146,12 +146,12 @@ class StructureScorer:
         return model
 
     @staticmethod
-    def _patch_config(model_path: str, esmc_model_path: str) -> str:
-        """Create a temp directory with a modified config.json pointing to a local ESMC."""
+    def _patch_config(model_path: str, esmc_model_id: str) -> str:
+        """Create a temp directory with a modified config.json overriding esmc_id."""
         config_file = os.path.join(model_path, "config.json")
         with open(config_file) as f:
             config_dict = json.load(f)
-        config_dict["esmc_id"] = esmc_model_path
+        config_dict["esmc_id"] = esmc_model_id
 
         tmp_dir = tempfile.mkdtemp(prefix="esmfold_scorer_")
         for item in os.listdir(model_path):
