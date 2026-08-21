@@ -137,7 +137,7 @@ class StructureScorer:
             load_path = self._patch_config(model_path, esmc_model_id)
 
         model = model_cls.from_pretrained(load_path)
-        model = model.to(device=self.device, dtype=self.dtype).eval()
+        model = model.to(self.device).eval()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
@@ -233,12 +233,20 @@ class StructureScorer:
         per_seq_ptm: list[float] = []
         lengths: list[int] = []
 
+        use_autocast = self.dtype != torch.float32
+        ctx = (
+            torch.autocast(device_type=self.device.type, dtype=self.dtype)
+            if use_autocast
+            else torch.no_grad()
+        )
+
         for seq in sequences:
-            output = self._model.infer_protein(
-                seq,
-                num_loops=loops,
-                num_sampling_steps=steps,
-            )
+            with ctx:
+                output = self._model.infer_protein(
+                    seq,
+                    num_loops=loops,
+                    num_sampling_steps=steps,
+                )
             per_seq_plddt.append(float(output["plddt"].mean()))
             per_seq_ptm.append(float(output["ptm"].mean()))
             lengths.append(len(seq))
