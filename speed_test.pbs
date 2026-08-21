@@ -23,6 +23,7 @@ source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
 
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export PYTHONPATH="${PBS_O_WORKDIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # ---------------------------------------------------------------------------
 # Paths — edit these if your layout differs
