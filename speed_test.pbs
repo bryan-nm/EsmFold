@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
-set -euo pipefail
+set -eo pipefail
 
 module load frameworks
 source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
