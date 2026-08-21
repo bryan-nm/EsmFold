@@ -163,7 +163,7 @@ def evaluate_generated_sequences(sequences: list[str]) -> dict:
 |-----------------------|----------------------------|-----------------------------------------------------------------------|
 | `model_path`          | `"biohub/ESMFold2-Fast"`   | Local weights directory or HuggingFace Hub id.                        |
 | `device`              | `None` (auto)              | `"xpu"`, `"cuda"`, `"cpu"`, or `None` for auto-detect.               |
-| `dtype`               | `None` (auto)              | `bfloat16` on accelerators, `float32` on CPU. Override if needed.     |
+| `dtype`               | `None`                     | Reserved. Inference runs in float32 (esm handles autocast on CUDA).   |
 | `esmc_model_id`       | `None`                     | Hub repo ID for ESM-C backbone. `None` uses config default.           |
 | `num_sampling_steps`  | `10`                       | Diffusion steps. Lower = faster. Paper default: 50.                   |
 | `num_loops`           | `1`                        | Trunk recycling loops. Lower = faster. Paper default: 3.              |
@@ -218,8 +218,10 @@ The scorer auto-detects the best available device:
 Override with `device="xpu"` / `device="cuda"` / `device="cpu"` in the
 constructor or `--device` on the CLI.
 
-On **Intel Aurora (XPU)**, `bfloat16` is the native high-throughput dtype
-and is selected automatically.  The same dtype is used on CUDA (Ampere+).
+On **CUDA (Ampere+)**, the esm package uses `torch.autocast` internally
+for mixed-precision bf16 inference.  On **Intel Aurora (XPU)**, inference
+runs in float32 (XPU lacks bf16 kernels for some linalg ops used by the
+diffusion head).
 
 ## Speed test (Aurora)
 

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from esmfold_scorer.device import optimal_dtype, resolve_device
+from esmfold_scorer.device import resolve_device
 
 log = logging.getLogger(__name__)
 
@@ -75,8 +75,9 @@ class StructureScorer:
         ``"xpu"``, ``"cuda"``, ``"cpu"``, or ``None`` to auto-detect.
         Auto-detection prefers XPU > CUDA > CPU.
     dtype:
-        Inference dtype.  ``None`` selects ``bfloat16`` on accelerators,
-        ``float32`` on CPU.
+        Reserved for future use.  Inference currently runs in float32
+        (the esm package manages autocast internally on CUDA; XPU
+        lacks bf16 kernels for required linalg ops).
     esmc_model_id:
         HuggingFace Hub repo ID for the ESM-C backbone (e.g.
         ``"biohub/ESMC-6B"``).  If ``None``, uses the default from the
@@ -109,15 +110,13 @@ class StructureScorer:
         compile_model: bool = False,
     ) -> None:
         self.device = resolve_device(device)
-        self.dtype = dtype or optimal_dtype(self.device)
         self.num_sampling_steps = num_sampling_steps
         self.num_loops = num_loops
 
         log.info(
-            "Loading ESMFold2-Fast from %s (device=%s, dtype=%s)",
+            "Loading ESMFold2-Fast from %s (device=%s, inference_dtype=float32)",
             model_path,
             self.device,
-            self.dtype,
         )
         t0 = time.monotonic()
         self._model = self._load_model(model_path, esmc_model_id, compile_model)
@@ -233,20 +232,12 @@ class StructureScorer:
         per_seq_ptm: list[float] = []
         lengths: list[int] = []
 
-        use_autocast = self.dtype != torch.float32
-        ctx = (
-            torch.autocast(device_type=self.device.type, dtype=self.dtype)
-            if use_autocast
-            else torch.no_grad()
-        )
-
         for seq in sequences:
-            with ctx:
-                output = self._model.infer_protein(
-                    seq,
-                    num_loops=loops,
-                    num_sampling_steps=steps,
-                )
+            output = self._model.infer_protein(
+                seq,
+                num_loops=loops,
+                num_sampling_steps=steps,
+            )
             per_seq_plddt.append(float(output["plddt"].mean()))
             per_seq_ptm.append(float(output["ptm"].mean()))
             lengths.append(len(seq))
