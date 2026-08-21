@@ -45,6 +45,11 @@ export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export HF_HUB_OFFLINE=1
 
+# Enumerate any aten ops silently falling back XPU -> CPU. Those fallbacks
+# are both a performance cliff and (for linalg ops) a source of GPU page
+# faults on Aurora's compute-runtime; the scorer patches the known ones.
+export PYTORCH_DEBUG_XPU_FALLBACK=1
+
 # The frameworks module prepends its site-packages to PYTHONPATH, which
 # shadows venv-installed packages (like our newer transformers). Fix by
 # putting the venv's site-packages first.
@@ -118,6 +123,17 @@ scorer = StructureScorer(
 )
 t_load = time.monotonic() - t_load
 print(f"Model loaded in {t_load:.1f} s\n")
+
+# --- smoke test: one short sequence, minimal steps ---
+# Fails fast (seconds) if the XPU path is broken, instead of after the
+# full sweep. Uses the shortest sequence to minimise memory pressure.
+shortest = min(sequences, key=len)
+print(f"[smoke] scoring 1 sequence ({len(shortest)} aa, 2 steps, 1 loop)...",
+      flush=True)
+t_smoke = time.monotonic()
+smoke = scorer.score([shortest], num_sampling_steps=2, num_loops=1)
+print(f"[smoke] OK — pLDDT {smoke.mean_plddt:.2f} "
+      f"in {time.monotonic() - t_smoke:.1f} s\n", flush=True)
 
 # --- sweep configs ---
 configs = [

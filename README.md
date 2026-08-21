@@ -219,11 +219,35 @@ Override with `device="xpu"` / `device="cuda"` / `device="cpu"` in the
 constructor or `--device` on the CLI.
 
 On **CUDA (Ampere+)**, the esm package uses `torch.autocast` internally
-for mixed-precision bf16 inference.  On **Intel Aurora (XPU)**, the scorer
-patches ``F.linear`` and ``F.layer_norm`` to cast float32 feature tensors
-to bf16 (the esm package's autocast is CUDA-only).  Linalg ops used by
-the diffusion head (SVD, det) stay in float32 — they lack bf16 XPU
-kernels.
+for mixed-precision bf16 inference — no workarounds needed.
+
+### Aurora / XPU workarounds
+
+The esm package targets CUDA, so two things need patching on XPU.  Both
+are applied automatically when `device` resolves to `xpu`:
+
+1. **Dtype matching.**  esm's autocast is hardcoded to
+   `device_type="cuda"` and silently disables itself on XPU (you'll see
+   `UserWarning: CUDA is not available ... Disabling autocast`).  Model
+   weights are bf16 but `infer_protein` builds float32 feature tensors,
+   so `F.linear` and `F.layer_norm` are patched to cast inputs to the
+   weight dtype.
+
+2. **Linalg CPU round-trip.**  `torch.linalg.svd` has no XPU kernel.
+   PyTorch's automatic aten fallback to CPU corrupts GPU memory on
+   Aurora's compute-runtime — inference aborts with
+   `Segmentation fault from GPU`.  `svd` and `det` are patched to do the
+   CPU transfer explicitly, which keeps the dispatcher out of the
+   fallback path.  The tensors are small (per-residue 3×3 rotations), so
+   the cost is negligible.
+
+> **Integration caveat:** these are process-global monkey-patches on
+> `torch.linalg` and `torch.nn.functional`.  They are written to be
+> no-ops outside the cases they target — the linalg patches only trigger
+> on XPU tensors, and the dtype patches only cast when input and weight
+> dtypes already differ — but if your training code depends on
+> `F.linear` raising on a dtype mismatch, be aware they are in effect
+> once a `StructureScorer` is constructed on XPU.
 
 ## Speed test (Aurora)
 

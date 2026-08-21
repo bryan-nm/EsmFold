@@ -141,8 +141,10 @@ class StructureScorer:
         model = model_cls.from_pretrained(load_path)
         model = model.to(device=self.device, dtype=self.dtype).eval()
 
-        if self.device.type == "xpu" and self.dtype != torch.float32:
-            _patch_dtype_casting()
+        if self.device.type == "xpu":
+            _patch_linalg_cpu_roundtrip()
+            if self.dtype != torch.float32:
+                _patch_dtype_casting()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
@@ -271,6 +273,53 @@ class StructureScorer:
         """Normalize a sequence: uppercase, strip whitespace, replace unknowns."""
         seq = "".join(seq.upper().split())
         return "".join(c if c in VALID_AA else "X" for c in seq)
+
+
+def _patch_linalg_cpu_roundtrip() -> None:
+    """Route SVD/det through an explicit CPU round-trip on XPU.
+
+    ``torch.linalg.svd`` has no XPU kernel, so PyTorch's aten dispatcher
+    silently falls back to CPU ("Aten Op fallback from XPU to CPU").  That
+    automatic fallback corrupts GPU memory on Aurora's compute-runtime —
+    inference aborts with a GPU page fault ("Segmentation fault from GPU",
+    varying page-table levels) immediately after the fallback warning.
+
+    Doing the device transfer ourselves — copy to CPU, compute in float32,
+    copy the result back — keeps the dispatcher out of the fallback path
+    and avoids the fault.  The tensors involved are per-residue 3x3
+    rotation matrices, so the round-trip cost is negligible.
+    """
+    if getattr(torch.linalg.svd, "_xpu_patched", False):
+        return
+
+    _orig_svd = torch.linalg.svd
+
+    def _svd_cpu(A, full_matrices=True, **kwargs):
+        if A.is_xpu:
+            U, S, Vh = _orig_svd(
+                A.detach().to("cpu", torch.float32), full_matrices=full_matrices
+            )
+            return (
+                U.to(A.device, A.dtype),
+                S.to(A.device, A.dtype),
+                Vh.to(A.device, A.dtype),
+            )
+        return _orig_svd(A, full_matrices=full_matrices, **kwargs)
+
+    _svd_cpu._xpu_patched = True
+    torch.linalg.svd = _svd_cpu
+
+    _orig_det = torch.linalg.det
+
+    def _det_cpu(A):
+        if A.is_xpu:
+            return _orig_det(A.detach().to("cpu", torch.float32)).to(A.device, A.dtype)
+        return _orig_det(A)
+
+    _det_cpu._xpu_patched = True
+    torch.linalg.det = _det_cpu
+
+    log.info("Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)")
 
 
 def _patch_dtype_casting() -> None:
