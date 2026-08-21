@@ -75,9 +75,9 @@ class StructureScorer:
         ``"xpu"``, ``"cuda"``, ``"cpu"``, or ``None`` to auto-detect.
         Auto-detection prefers XPU > CUDA > CPU.
     dtype:
-        Reserved for future use.  Inference currently runs in float32
-        (the esm package manages autocast internally on CUDA; XPU
-        lacks bf16 kernels for required linalg ops).
+        Inference dtype for autocast.  ``None`` selects ``bfloat16`` on
+        accelerators, ``float32`` on CPU.  On XPU this is used via
+        ``torch.autocast`` (the esm package only autocasts for CUDA).
     esmc_model_id:
         HuggingFace Hub repo ID for the ESM-C backbone (e.g.
         ``"biohub/ESMC-6B"``).  If ``None``, uses the default from the
@@ -110,13 +110,20 @@ class StructureScorer:
         compile_model: bool = False,
     ) -> None:
         self.device = resolve_device(device)
+        self.dtype = dtype or _optimal_dtype(self.device)
         self.num_sampling_steps = num_sampling_steps
         self.num_loops = num_loops
 
+        self._use_autocast = (
+            self.device.type == "xpu" and self.dtype != torch.float32
+        )
+
         log.info(
-            "Loading ESMFold2-Fast from %s (device=%s, inference_dtype=float32)",
+            "Loading ESMFold2-Fast from %s (device=%s, dtype=%s, autocast=%s)",
             model_path,
             self.device,
+            self.dtype,
+            self._use_autocast,
         )
         t0 = time.monotonic()
         self._model = self._load_model(model_path, esmc_model_id, compile_model)
@@ -136,7 +143,10 @@ class StructureScorer:
             load_path = self._patch_config(model_path, esmc_model_id)
 
         model = model_cls.from_pretrained(load_path)
-        model = model.to(device=self.device, dtype=torch.float32).eval()
+        model = model.to(self.device).eval()
+
+        if self._use_autocast:
+            _patch_linalg_for_xpu()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
@@ -233,11 +243,21 @@ class StructureScorer:
         lengths: list[int] = []
 
         for seq in sequences:
-            output = self._model.infer_protein(
-                seq,
-                num_loops=loops,
-                num_sampling_steps=steps,
-            )
+            if self._use_autocast:
+                with torch.autocast(
+                    device_type=self.device.type, dtype=self.dtype
+                ):
+                    output = self._model.infer_protein(
+                        seq,
+                        num_loops=loops,
+                        num_sampling_steps=steps,
+                    )
+            else:
+                output = self._model.infer_protein(
+                    seq,
+                    num_loops=loops,
+                    num_sampling_steps=steps,
+                )
             per_seq_plddt.append(float(output["plddt"].mean()))
             per_seq_ptm.append(float(output["ptm"].mean()))
             lengths.append(len(seq))
@@ -265,3 +285,25 @@ class StructureScorer:
         """Normalize a sequence: uppercase, strip whitespace, replace unknowns."""
         seq = "".join(seq.upper().split())
         return "".join(c if c in VALID_AA else "X" for c in seq)
+
+
+def _optimal_dtype(device: torch.device) -> torch.dtype:
+    if device.type in ("xpu", "cuda"):
+        return torch.bfloat16
+    return torch.float32
+
+
+def _patch_linalg_for_xpu() -> None:
+    """Wrap linalg ops that lack bf16 XPU kernels to cast through float32."""
+    if getattr(torch.linalg.det, "_xpu_patched", False):
+        return
+    _orig_det = torch.linalg.det
+
+    def _det_f32(input):
+        if input.is_xpu and input.dtype == torch.bfloat16:
+            return _orig_det(input.float()).to(torch.bfloat16)
+        return _orig_det(input)
+
+    _det_f32._xpu_patched = True
+    torch.linalg.det = _det_f32
+    log.info("Patched torch.linalg.det for bf16 XPU (casts through float32)")
