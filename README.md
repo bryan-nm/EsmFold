@@ -48,27 +48,39 @@ and HuggingFace `transformers` ≥ 4.57.
 
 On systems like ALCF Aurora where PyTorch and IPEX come from a
 `module load frameworks`, create a lightweight venv that inherits the
-system packages and only adds the two missing dependencies:
+system packages.  The `esm` package must be installed with `--no-deps`
+to prevent it from pulling a PyPI CUDA `torch` build that would shadow
+the system's XPU torch:
 
 ```bash
 module load frameworks
 python -m venv /path/to/esmfold-env --system-site-packages
 source /path/to/esmfold-env/bin/activate
-pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
+pip install 'transformers>=4.57'
+pip install --no-deps 'esm @ git+https://github.com/Biohub/esm.git@main'
+pip install biopython biotite cloudpathlib   # esm's non-torch runtime deps
 ```
 
 `--system-site-packages` inherits `torch`, `intel_extension_for_pytorch`,
-`oneCCL`, etc. from the frameworks module — only `transformers` and `esm`
-are installed into the venv.
+`oneCCL`, etc. from the frameworks module.
 
 ### Integrating into another project's environment
 
-If your generative model already has its own venv, install the two
-runtime dependencies there instead of creating a separate environment:
+If your generative model already has its own venv (including on Aurora),
+add the dependencies there instead of creating a separate environment.
+Use `--no-deps` on `esm` if the venv's `torch` comes from a
+non-PyPI source (e.g. the Aurora frameworks module):
 
 ```bash
 source /path/to/your-project-env/bin/activate
+
+# Standard install (torch from PyPI):
 pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
+
+# Or XPU / custom-torch install (prevent esm from clobbering your torch):
+pip install 'transformers>=4.57'
+pip install --no-deps 'esm @ git+https://github.com/Biohub/esm.git@main'
+pip install biopython biotite cloudpathlib
 ```
 
 Then either `pip install -e /path/to/EsmFold` to make `esmfold_scorer`
@@ -78,7 +90,7 @@ importable, or add `EsmFold/src` to `PYTHONPATH`:
 export PYTHONPATH="/path/to/EsmFold/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The scorer has no dependencies beyond `torch`, `transformers>=4.57`, and
+The scorer's runtime dependencies are `torch`, `transformers>=4.57`, and
 `esm` — it should coexist cleanly with any training framework.
 
 ### Model weights

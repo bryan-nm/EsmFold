@@ -27,10 +27,13 @@ module load frameworks
 #   module load frameworks
 #   python -m venv /flare/NLDesignProtein/bryan/envs/esmfold-env --system-site-packages
 #   source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
-#   pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
+#   pip install 'transformers>=4.57'
+#   pip install --no-deps 'esm @ git+https://github.com/Biohub/esm.git@main'
+#   pip install biopython biotite cloudpathlib
 #
 # --system-site-packages inherits torch, ipex, oneCCL, etc. from the
-# frameworks module so only the two missing packages are installed.
+# frameworks module.  --no-deps on esm prevents it from pulling a PyPI
+# CUDA torch build that would shadow the system XPU torch.
 # ---------------------------------------------------------------------------
 source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
 
