@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from esmfold_scorer.device import resolve_device
+from esmfold_scorer.device import optimal_dtype, resolve_device
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +75,10 @@ class StructureScorer:
         ``"xpu"``, ``"cuda"``, ``"cpu"``, or ``None`` to auto-detect.
         Auto-detection prefers XPU > CUDA > CPU.
     dtype:
-        Inference dtype for autocast.  ``None`` selects ``bfloat16`` on
-        accelerators, ``float32`` on CPU.  On XPU this is used via
-        ``torch.autocast`` (the esm package only autocasts for CUDA).
+        Inference dtype.  ``None`` selects ``bfloat16`` on accelerators,
+        ``float32`` on CPU.  On XPU, the model weights are converted to
+        this dtype and ``F.linear`` / ``F.layer_norm`` are patched to
+        handle float32 inputs from the esm package's feature construction.
     esmc_model_id:
         HuggingFace Hub repo ID for the ESM-C backbone (e.g.
         ``"biohub/ESMC-6B"``).  If ``None``, uses the default from the
@@ -110,20 +111,15 @@ class StructureScorer:
         compile_model: bool = False,
     ) -> None:
         self.device = resolve_device(device)
-        self.dtype = dtype or _optimal_dtype(self.device)
+        self.dtype = dtype or optimal_dtype(self.device)
         self.num_sampling_steps = num_sampling_steps
         self.num_loops = num_loops
 
-        self._use_autocast = (
-            self.device.type == "xpu" and self.dtype != torch.float32
-        )
-
         log.info(
-            "Loading ESMFold2-Fast from %s (device=%s, dtype=%s, autocast=%s)",
+            "Loading ESMFold2-Fast from %s (device=%s, dtype=%s)",
             model_path,
             self.device,
             self.dtype,
-            self._use_autocast,
         )
         t0 = time.monotonic()
         self._model = self._load_model(model_path, esmc_model_id, compile_model)
@@ -143,10 +139,10 @@ class StructureScorer:
             load_path = self._patch_config(model_path, esmc_model_id)
 
         model = model_cls.from_pretrained(load_path)
-        model = model.to(self.device).eval()
+        model = model.to(device=self.device, dtype=self.dtype).eval()
 
-        if self._use_autocast:
-            _patch_linalg_for_xpu()
+        if self.device.type == "xpu" and self.dtype != torch.float32:
+            _patch_dtype_casting()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
@@ -243,21 +239,11 @@ class StructureScorer:
         lengths: list[int] = []
 
         for seq in sequences:
-            if self._use_autocast:
-                with torch.autocast(
-                    device_type=self.device.type, dtype=self.dtype
-                ):
-                    output = self._model.infer_protein(
-                        seq,
-                        num_loops=loops,
-                        num_sampling_steps=steps,
-                    )
-            else:
-                output = self._model.infer_protein(
-                    seq,
-                    num_loops=loops,
-                    num_sampling_steps=steps,
-                )
+            output = self._model.infer_protein(
+                seq,
+                num_loops=loops,
+                num_sampling_steps=steps,
+            )
             per_seq_plddt.append(float(output["plddt"].mean()))
             per_seq_ptm.append(float(output["ptm"].mean()))
             lengths.append(len(seq))
@@ -287,23 +273,45 @@ class StructureScorer:
         return "".join(c if c in VALID_AA else "X" for c in seq)
 
 
-def _optimal_dtype(device: torch.device) -> torch.dtype:
-    if device.type in ("xpu", "cuda"):
-        return torch.bfloat16
-    return torch.float32
+def _patch_dtype_casting() -> None:
+    """Patch F.linear and F.layer_norm to cast inputs to match weight dtype.
 
+    The esm package's infer_protein creates float32 feature tensors
+    internally, but the model weights are bf16. On CUDA the esm package
+    uses torch.autocast to handle this; on XPU that autocast is disabled
+    (hardcoded to device_type="cuda"). These patches provide the same
+    dtype-matching behaviour without autocast, which avoids promoting
+    linalg ops (SVD, det) to bf16 — those ops lack bf16 XPU kernels and
+    crash the GPU driver when autocast forces them into bf16.
+    """
+    import torch.nn.functional as F
 
-def _patch_linalg_for_xpu() -> None:
-    """Wrap linalg ops that lack bf16 XPU kernels to cast through float32."""
-    if getattr(torch.linalg.det, "_xpu_patched", False):
+    if getattr(F, "_xpu_dtype_patched", False):
         return
-    _orig_det = torch.linalg.det
 
-    def _det_f32(input):
-        if input.is_xpu and input.dtype == torch.bfloat16:
-            return _orig_det(input.float()).to(torch.bfloat16)
-        return _orig_det(input)
+    _orig_linear = F.linear
 
-    _det_f32._xpu_patched = True
-    torch.linalg.det = _det_f32
-    log.info("Patched torch.linalg.det for bf16 XPU (casts through float32)")
+    def _linear_match_dtype(input, weight, bias=None):
+        if input.is_floating_point() and input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
+        if bias is not None and bias.dtype != weight.dtype:
+            bias = bias.to(weight.dtype)
+        return _orig_linear(input, weight, bias)
+
+    F.linear = _linear_match_dtype
+
+    _orig_layer_norm = F.layer_norm
+
+    def _layer_norm_match_dtype(
+        input, normalized_shape, weight=None, bias=None, eps=1e-5
+    ):
+        if weight is not None and input.is_floating_point() and input.dtype != weight.dtype:
+            input = input.to(weight.dtype)
+        return _orig_layer_norm(input, normalized_shape, weight, bias, eps)
+
+    F.layer_norm = _layer_norm_match_dtype
+
+    F._xpu_dtype_patched = True
+    log.info(
+        "Patched F.linear and F.layer_norm for XPU bf16 dtype matching"
+    )
