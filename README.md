@@ -44,14 +44,42 @@ pip install -e .
 This installs the `esm` package from the [Biohub GitHub repo](https://github.com/Biohub/esm)
 and HuggingFace `transformers` ≥ 4.57.
 
-### XPU support (Intel Aurora / Ponte Vecchio)
+### Aurora / HPC setup
+
+On systems like ALCF Aurora where PyTorch and IPEX come from a
+`module load frameworks`, create a lightweight venv that inherits the
+system packages and only adds the two missing dependencies:
 
 ```bash
-pip install -e ".[xpu]"
+module load frameworks
+python -m venv /path/to/esmfold-env --system-site-packages
+source /path/to/esmfold-env/bin/activate
+pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
 ```
 
-This additionally installs `intel-extension-for-pytorch`, which registers
-the `xpu` device backend.
+`--system-site-packages` inherits `torch`, `intel_extension_for_pytorch`,
+`oneCCL`, etc. from the frameworks module — only `transformers` and `esm`
+are installed into the venv.
+
+### Integrating into another project's environment
+
+If your generative model already has its own venv, install the two
+runtime dependencies there instead of creating a separate environment:
+
+```bash
+source /path/to/your-project-env/bin/activate
+pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
+```
+
+Then either `pip install -e /path/to/EsmFold` to make `esmfold_scorer`
+importable, or add `EsmFold/src` to `PYTHONPATH`:
+
+```bash
+export PYTHONPATH="/path/to/EsmFold/src${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+The scorer has no dependencies beyond `torch`, `transformers>=4.57`, and
+`esm` — it should coexist cleanly with any training framework.
 
 ### Model weights
 

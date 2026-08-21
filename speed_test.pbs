@@ -19,7 +19,20 @@ cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 set -eo pipefail
 
 module load frameworks
-source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+
+# ---------------------------------------------------------------------------
+# Environment — uses a dedicated venv layered on top of the frameworks module.
+# To create it (once, from a login node):
+#
+#   module load frameworks
+#   python -m venv /flare/NLDesignProtein/bryan/envs/esmfold-env --system-site-packages
+#   source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
+#   pip install 'transformers>=4.57' 'esm @ git+https://github.com/Biohub/esm.git@main'
+#
+# --system-site-packages inherits torch, ipex, oneCCL, etc. from the
+# frameworks module so only the two missing packages are installed.
+# ---------------------------------------------------------------------------
+source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
 
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
