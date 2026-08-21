@@ -126,22 +126,16 @@ class StructureScorer:
         esmc_model_path: str | None,
         compile_model: bool,
     ) -> torch.nn.Module:
-        model_cls = self._resolve_model_class()
+        model_cls, config_cls = self._resolve_classes()
         kwargs: dict = {"torch_dtype": self.dtype}
 
         if esmc_model_path is not None:
-            from transformers import AutoConfig
-
-            config = AutoConfig.from_pretrained(
-                model_path, trust_remote_code=True,
-            )
+            config = config_cls.from_pretrained(model_path)
             config.esmc_id = esmc_model_path
             log.info("Overriding ESM-C backbone path to %s", esmc_model_path)
             kwargs["config"] = config
 
-        model = model_cls.from_pretrained(
-            model_path, trust_remote_code=True, **kwargs,
-        )
+        model = model_cls.from_pretrained(model_path, **kwargs)
         model = model.to(self.device).eval()
 
         if compile_model:
@@ -151,18 +145,32 @@ class StructureScorer:
         return model
 
     @staticmethod
-    def _resolve_model_class() -> type:
+    def _resolve_classes() -> tuple[type, type]:
+        # 1. Try transformers >= 4.57 (has esmfold2 built-in)
         try:
             from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
-            return ESMFold2Model
+            from transformers.models.esmfold2.configuration_esmfold2 import ESMFold2Config
+            log.info("Using ESMFold2 from transformers")
+            return ESMFold2Model, ESMFold2Config
         except (ImportError, ModuleNotFoundError):
             pass
-        from transformers import AutoModel
-        log.info(
-            "transformers.models.esmfold2 not found; "
-            "falling back to AutoModel (trust_remote_code=True)"
+
+        # 2. Try the esm package (registers model with transformers on import)
+        try:
+            import esm  # noqa: F401 — triggers model registration
+            from transformers import AutoModel, AutoConfig
+            AutoConfig.from_pretrained.__func__  # just verify it's callable
+            log.info("Using ESMFold2 via esm package registration")
+            return AutoModel, AutoConfig
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        raise ImportError(
+            "Cannot find ESMFold2 model class. Install either:\n"
+            "  pip install 'transformers>=4.57'          (has esmfold2 built-in)\n"
+            "  pip install 'esm @ git+https://github.com/Biohub/esm.git@main'\n"
+            "    (registers esmfold2 with transformers at import time)"
         )
-        return AutoModel
 
     @torch.inference_mode()
     def score(
