@@ -126,22 +126,22 @@ class StructureScorer:
         esmc_model_path: str | None,
         compile_model: bool,
     ) -> torch.nn.Module:
-        from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+        model_cls = self._resolve_model_class()
+        kwargs: dict = {"torch_dtype": self.dtype}
 
         if esmc_model_path is not None:
             from transformers import AutoConfig
 
-            config = AutoConfig.from_pretrained(model_path)
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True,
+            )
             config.esmc_id = esmc_model_path
             log.info("Overriding ESM-C backbone path to %s", esmc_model_path)
-            model = ESMFold2Model.from_pretrained(
-                model_path, config=config, torch_dtype=self.dtype
-            )
-        else:
-            model = ESMFold2Model.from_pretrained(
-                model_path, torch_dtype=self.dtype
-            )
+            kwargs["config"] = config
 
+        model = model_cls.from_pretrained(
+            model_path, trust_remote_code=True, **kwargs,
+        )
         model = model.to(self.device).eval()
 
         if compile_model:
@@ -149,6 +149,20 @@ class StructureScorer:
             model = torch.compile(model)
 
         return model
+
+    @staticmethod
+    def _resolve_model_class() -> type:
+        try:
+            from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
+            return ESMFold2Model
+        except (ImportError, ModuleNotFoundError):
+            pass
+        from transformers import AutoModel
+        log.info(
+            "transformers.models.esmfold2 not found; "
+            "falling back to AutoModel (trust_remote_code=True)"
+        )
+        return AutoModel
 
     @torch.inference_mode()
     def score(
