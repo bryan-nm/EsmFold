@@ -136,7 +136,7 @@ class StructureScorer:
             load_path = self._patch_config(model_path, esmc_model_id)
 
         model = model_cls.from_pretrained(load_path)
-        model = model.to(self.device).eval()
+        model = model.to(device=self.device, dtype=torch.float32).eval()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
