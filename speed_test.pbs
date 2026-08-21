@@ -34,12 +34,21 @@ module load frameworks
 # --system-site-packages inherits torch, ipex, oneCCL, etc. from the
 # frameworks module.  --no-deps on esm prevents it from pulling a PyPI
 # CUDA torch build that would shadow the system XPU torch.
+#
+# IMPORTANT: transformers must be force-installed so the venv has its
+# own copy (pip may skip it if the system version looks sufficient):
+#   pip install --ignore-installed 'transformers>=4.57'
 # ---------------------------------------------------------------------------
 source /flare/NLDesignProtein/bryan/envs/esmfold-env/bin/activate
 
 export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export PYTHONPATH="${PBS_O_WORKDIR}/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# The frameworks module prepends its site-packages to PYTHONPATH, which
+# shadows venv-installed packages (like our newer transformers). Fix by
+# putting the venv's site-packages first.
+VENV_SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+export PYTHONPATH="${VENV_SITE}:${PBS_O_WORKDIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # ---------------------------------------------------------------------------
 # Paths — edit these if your layout differs
