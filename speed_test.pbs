@@ -1,0 +1,112 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N esmfold_speed_test
+#PBS -l walltime=01:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+#PBS -M bryan.andrews.phd@gmail.com
+#PBS -m be
+
+# ---------------------------------------------------------------------------
+# Speed test: score 100 SwissProt sequences at several step/loop configs.
+# Single-node, single-tile inference — loads model ONCE, then sweeps.
+# ---------------------------------------------------------------------------
+
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+set -euo pipefail
+
+module load frameworks
+source /flare/NLDesignProtein/bryan/envs/filip-env/bin/activate
+
+export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+
+# ---------------------------------------------------------------------------
+# Paths — edit these if your layout differs
+# ---------------------------------------------------------------------------
+ESMFOLD_WEIGHTS="/flare/NLDesignProtein/bryan/models/ESMFold2-Fast"
+ESMC_BACKBONE="${HOME}/.cache/huggingface/hub/models--biohub--ESMC-6B/"
+FASTA="test_sequences.fasta"
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+echo "================================================================"
+echo "  ESMFold2-Fast speed test"
+echo "================================================================"
+echo "  job           : ${PBS_JOBID:-<interactive>}  ${PBS_JOBNAME:-}"
+echo "  started       : $(date '+%Y-%m-%dT%H:%M:%S%z')"
+echo "  user@host     : $(whoami)@$(hostname)"
+echo "  repo          : $(pwd)"
+echo "  weights       : ${ESMFOLD_WEIGHTS}"
+echo "  esmc backbone : ${ESMC_BACKBONE}"
+echo "  fasta         : ${FASTA} ($(grep -c '^>' ${FASTA}) sequences)"
+echo "  python        : $(which python)"
+echo "  torch         : $(python -c 'import torch; print(torch.__version__)')"
+echo "  ipex          : $(python -c 'import intel_extension_for_pytorch; print(intel_extension_for_pytorch.__version__)' 2>/dev/null || echo 'not installed')"
+echo "  xpu devices   : $(python -c 'import torch; import intel_extension_for_pytorch; print(torch.xpu.device_count())' 2>/dev/null || echo 'N/A')"
+echo "================================================================"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Run: load model once, sweep step/loop configs
+# ---------------------------------------------------------------------------
+python - "${ESMFOLD_WEIGHTS}" "${ESMC_BACKBONE}" "${FASTA}" <<'PYEOF'
+import sys
+import time
+
+model_path, esmc_path, fasta_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# --- parse FASTA ---
+sequences = []
+with open(fasta_path) as f:
+    header, chunks = "", []
+    for line in f:
+        line = line.strip()
+        if line.startswith(">"):
+            if chunks:
+                sequences.append("".join(chunks))
+            header = line
+            chunks = []
+        elif line:
+            chunks.append(line)
+    if chunks:
+        sequences.append("".join(chunks))
+
+print(f"Loaded {len(sequences)} sequences "
+      f"({min(len(s) for s in sequences)}-{max(len(s) for s in sequences)} aa)\n")
+
+# --- load model once ---
+from esmfold_scorer import StructureScorer
+
+t_load = time.monotonic()
+scorer = StructureScorer(
+    model_path=model_path,
+    esmc_model_path=esmc_path,
+    device="xpu",
+)
+t_load = time.monotonic() - t_load
+print(f"Model loaded in {t_load:.1f} s\n")
+
+# --- sweep configs ---
+configs = [
+    (5, 1), (10, 1), (20, 1), (50, 1),
+    (5, 3), (10, 3), (20, 3), (50, 3),
+]
+
+print(f"{'steps':>5}  {'loops':>5}  {'pLDDT':>7}  {'time (s)':>9}  {'seq/s':>7}  {'s/seq':>7}")
+print("-" * 55)
+
+for steps, loops in configs:
+    result = scorer.score(sequences, num_sampling_steps=steps, num_loops=loops)
+    n = result.num_sequences
+    t = result.elapsed_seconds
+    print(f"{steps:>5}  {loops:>5}  {result.mean_plddt:>7.2f}  {t:>9.1f}  {n/t:>7.2f}  {t/n:>7.2f}")
+
+print()
+PYEOF
+
+echo "[job] finished $(date '+%Y-%m-%dT%H:%M:%S%z')"

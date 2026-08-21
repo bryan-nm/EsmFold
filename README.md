@@ -1,0 +1,233 @@
+# esmfold-scorer
+
+Fast mean-pLDDT scoring from protein sequences using **ESMFold2-Fast**.
+Designed as a drop-in evaluation step for protein generative models:
+load the structure predictor once, then score batches of generated
+sequences on-the-fly during training.
+
+## What it does
+
+Given one or more amino-acid sequences, `esmfold-scorer` runs ESMFold2-Fast
+(a single-sequence, diffusion-based structure prediction model) and returns:
+
+- **mean pLDDT** — per-sequence and overall, on the standard 0–100 scale.
+  Higher is better; ≥70 generally indicates a confident fold.
+- **pTM** — predicted template modeling score (0–1).  Measures global
+  structural accuracy.
+- **Timing** — wall-clock seconds, useful for throughput budgeting.
+
+pLDDT is the primary metric for evaluating whether a generative model is
+producing sequences that fold into well-defined 3D structures.
+
+## Speed defaults
+
+The paper-default inference settings (50 diffusion steps, 3 recycling
+loops) maximize absolute accuracy.  For **relative ranking** during
+training — which is what an eval loop needs — fewer steps are sufficient:
+
+| Preset     | `num_sampling_steps` | `num_loops` | Relative speed |
+|------------|---------------------:|------------:|:--------------:|
+| Paper      |                   50 |           3 | 1×             |
+| Default    |                   10 |           1 | ~8–12×         |
+| Ultra-fast |                    5 |           1 | ~15–20×        |
+
+The ranking correlation between 10-step and 50-step pLDDT is high for
+typical generated sequences.  Start with the defaults and increase
+`num_sampling_steps` only if you need publication-quality absolute scores.
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+This installs the `esm` package from the [Biohub GitHub repo](https://github.com/Biohub/esm)
+and HuggingFace `transformers` ≥ 4.57.
+
+### XPU support (Intel Aurora / Ponte Vecchio)
+
+```bash
+pip install -e ".[xpu]"
+```
+
+This additionally installs `intel-extension-for-pytorch`, which registers
+the `xpu` device backend.
+
+### Model weights
+
+The first time you load the model, it needs:
+
+1. **ESMFold2-Fast weights** — 720 MB.  Point `model_path` to a local
+   directory (containing `config.json` + `model.safetensors`), or use
+   `"biohub/ESMFold2-Fast"` to download from HuggingFace Hub.
+2. **ESM-C 6B backbone** — ~24 GB.  Downloaded automatically by the
+   `esm` package on first load and cached in the HuggingFace cache
+   directory (`~/.cache/huggingface/hub/`).
+
+For air-gapped or HPC environments, pre-download both and point to local
+paths.  Use the `esmc_model_path` parameter (or `--esmc-path` on the CLI)
+to redirect the backbone load to a local directory instead of downloading
+from HuggingFace Hub:
+
+```python
+scorer = StructureScorer(
+    model_path="/flare/models/ESMFold2-Fast",
+    esmc_model_path="~/.cache/huggingface/hub/models--biohub--ESMC-6B/",
+)
+```
+
+## Python API
+
+### Minimal example
+
+```python
+from esmfold_scorer import StructureScorer
+
+scorer = StructureScorer("/path/to/ESMFold2-Fast")
+results = scorer.score(["MQIFVKTLTGKTITLEVEPSDTIENVKAK"])
+
+print(results.mean_plddt)          # e.g. 82.5
+print(results.per_sequence_plddt)  # [82.5]
+print(results.per_sequence_ptm)    # [0.87]
+print(results.elapsed_seconds)     # 1.23
+```
+
+### Integration into a training eval loop
+
+```python
+import torch
+from esmfold_scorer import StructureScorer
+
+# --- once, at eval setup ---
+scorer = StructureScorer(
+    model_path="/models/ESMFold2-Fast",
+    device="xpu",              # auto-detects if None
+    num_sampling_steps=10,     # fast defaults
+    num_loops=1,
+)
+
+# --- inside your eval callback ---
+def evaluate_generated_sequences(sequences: list[str]) -> dict:
+    """Score a batch of generated sequences and return metrics."""
+    results = scorer.score(sequences)
+    return {
+        "mean_plddt": results.mean_plddt,
+        "per_sequence_plddt": results.per_sequence_plddt,
+        "num_sequences": results.num_sequences,
+        "scoring_time_s": results.elapsed_seconds,
+    }
+```
+
+### StructureScorer parameters
+
+| Parameter             | Default                    | Description                                                           |
+|-----------------------|----------------------------|-----------------------------------------------------------------------|
+| `model_path`          | `"biohub/ESMFold2-Fast"`   | Local weights directory or HuggingFace Hub id.                        |
+| `device`              | `None` (auto)              | `"xpu"`, `"cuda"`, `"cpu"`, or `None` for auto-detect.               |
+| `dtype`               | `None` (auto)              | `bfloat16` on accelerators, `float32` on CPU. Override if needed.     |
+| `esmc_model_path`     | `None`                     | Local ESM-C backbone path. `None` downloads from Hub.                 |
+| `num_sampling_steps`  | `10`                       | Diffusion steps. Lower = faster. Paper default: 50.                   |
+| `num_loops`           | `1`                        | Trunk recycling loops. Lower = faster. Paper default: 3.              |
+| `compile_model`       | `False`                    | Run `torch.compile()`. Slow startup, faster steady-state throughput.  |
+
+### ScoringResult fields
+
+| Field                   | Type          | Description                                     |
+|-------------------------|---------------|-------------------------------------------------|
+| `mean_plddt`            | `float`       | Scalar mean pLDDT across all sequences (0–100). |
+| `per_sequence_plddt`    | `list[float]` | Mean pLDDT for each input sequence.             |
+| `per_sequence_ptm`      | `list[float]` | pTM for each input sequence (0–1).              |
+| `per_sequence_lengths`  | `list[int]`   | Residue count for each input sequence.          |
+| `elapsed_seconds`       | `float`       | Wall-clock time for the scoring call.           |
+| `num_sequences`         | `int`         | Number of sequences scored.                     |
+
+## CLI
+
+```bash
+# Single sequence
+esmfold-score -m /models/ESMFold2-Fast -s "MQIFVKTLTGKTITL..."
+
+# FASTA file
+esmfold-score -m /models/ESMFold2-Fast -f generated.fasta
+
+# From stdin, one sequence per line
+cat seqs.txt | esmfold-score -m /models/ESMFold2-Fast --stdin
+
+# JSON output for programmatic consumption
+esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --json
+
+# Faster with fewer steps
+esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta --steps 5 --loops 1
+
+# Point to a local ESM-C backbone (avoids HuggingFace download)
+esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta \
+    --esmc-path ~/.cache/huggingface/hub/models--biohub--ESMC-6B/
+
+# Verbose logging (model load times, per-batch info)
+esmfold-score -m /models/ESMFold2-Fast -f seqs.fasta -v
+```
+
+## Device portability
+
+The scorer auto-detects the best available device:
+
+| Priority | Backend | When used                                     |
+|----------|---------|-----------------------------------------------|
+| 1        | XPU     | `intel_extension_for_pytorch` installed + GPU  |
+| 2        | CUDA    | NVIDIA GPU visible                             |
+| 3        | CPU     | Fallback                                       |
+
+Override with `device="xpu"` / `device="cuda"` / `device="cpu"` in the
+constructor or `--device` on the CLI.
+
+On **Intel Aurora (XPU)**, `bfloat16` is the native high-throughput dtype
+and is selected automatically.  The same dtype is used on CUDA (Ampere+).
+
+## Speed test (Aurora)
+
+A PBS job script and 100-sequence FASTA file are included for
+benchmarking on Aurora.  The script sweeps step/loop configurations
+and reports throughput:
+
+```bash
+qsub speed_test.pbs
+```
+
+Edit the paths at the top of `speed_test.pbs` if your weight / env
+locations differ.  Results go to the job's `.o` file.
+
+## Project structure
+
+```
+EsmFold/
+├── pyproject.toml                  # Package metadata and dependencies
+├── README.md
+├── speed_test.pbs                  # PBS job script for Aurora benchmarking
+├── test_sequences.fasta            # 100 SwissProt sequences (63–297 aa)
+└── src/
+    └── esmfold_scorer/
+        ├── __init__.py             # Public API: StructureScorer, ScoringResult
+        ├── scorer.py               # Model loading, inference, result aggregation
+        ├── device.py               # XPU / CUDA / CPU detection
+        └── cli.py                  # Command-line entry point
+```
+
+## Tuning for your workload
+
+**Short sequences (< 100 residues):** `torch.compile()` amortizes well.
+Pass `compile_model=True` if you're scoring hundreds of short peptides.
+
+**Long sequences (> 500 residues):** Memory dominates.  Keep
+`num_sampling_steps` low and consider `dtype=torch.float16` on CUDA if
+bf16 causes OOM.
+
+**Very large batches:** Sequences are scored one at a time (ESMFold2's
+`infer_protein` is single-sequence).  Throughput scales linearly with
+sequence count.  For maximum GPU utilization on short sequences, consider
+running multiple scorer processes.
+
+## License
+
+MIT — same as ESMFold2-Fast.  See the
+[third-party notice](https://github.com/Biohub/esm/blob/main/THIRD_PARTY_NOTICE.md)
+for ESMFold2's upstream dependencies.

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esmfold-scorer"
+version = "0.1.0"
+description = "Fast mean-pLDDT scoring from protein sequences using ESMFold2-Fast"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.57",
+    "esm @ git+https://github.com/Biohub/esm.git@main",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+xpu = ["intel-extension-for-pytorch>=2.1"]
+
+[project.scripts]
+esmfold-score = "esmfold_scorer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
