@@ -17,7 +17,10 @@ generative-model evaluation loop::
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -126,17 +129,15 @@ class StructureScorer:
         esmc_model_path: str | None,
         compile_model: bool,
     ) -> torch.nn.Module:
-        model_cls, config_cls = self._resolve_classes()
-        kwargs: dict = {"torch_dtype": self.dtype}
+        model_cls = self._resolve_model_class()
+        load_path = model_path
 
         if esmc_model_path is not None:
-            config = config_cls.from_pretrained(model_path)
-            config.esmc_id = esmc_model_path
             log.info("Overriding ESM-C backbone path to %s", esmc_model_path)
-            kwargs["config"] = config
+            load_path = self._patch_config(model_path, esmc_model_path)
 
-        model = model_cls.from_pretrained(model_path, **kwargs)
-        model = model.to(self.device).eval()
+        model = model_cls.from_pretrained(load_path)
+        model = model.to(device=self.device, dtype=self.dtype).eval()
 
         if compile_model:
             log.info("Compiling model with torch.compile (this takes a while)...")
@@ -145,22 +146,37 @@ class StructureScorer:
         return model
 
     @staticmethod
-    def _resolve_classes() -> tuple[type, type]:
+    def _patch_config(model_path: str, esmc_model_path: str) -> str:
+        """Create a temp directory with a modified config.json pointing to a local ESMC."""
+        config_file = os.path.join(model_path, "config.json")
+        with open(config_file) as f:
+            config_dict = json.load(f)
+        config_dict["esmc_id"] = esmc_model_path
+
+        tmp_dir = tempfile.mkdtemp(prefix="esmfold_scorer_")
+        for item in os.listdir(model_path):
+            src = os.path.join(model_path, item)
+            if os.path.isfile(src) and item != "config.json":
+                os.symlink(src, os.path.join(tmp_dir, item))
+        with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+            json.dump(config_dict, f)
+        return tmp_dir
+
+    @staticmethod
+    def _resolve_model_class() -> type:
         # 1. Try the esm package (provides EsmFold2Model directly)
         try:
             from esm.models.esmfold2 import EsmFold2Model
-            from esm.models.esmfold2.config import EsmFold2Config
             log.info("Using EsmFold2Model from esm package")
-            return EsmFold2Model, EsmFold2Config
+            return EsmFold2Model
         except (ImportError, ModuleNotFoundError):
             pass
 
         # 2. Try transformers (may have it built-in in future versions)
         try:
             from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
-            from transformers.models.esmfold2.configuration_esmfold2 import ESMFold2Config
             log.info("Using ESMFold2Model from transformers")
-            return ESMFold2Model, ESMFold2Config
+            return ESMFold2Model
         except (ImportError, ModuleNotFoundError):
             pass
 
