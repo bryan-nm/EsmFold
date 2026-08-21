@@ -93,6 +93,19 @@ class StructureScorer:
     num_loops:
         Folding-trunk recycling iterations.  Default **1** is fastest.
         Paper default is 3.
+    num_diffusion_samples:
+        Structures sampled per sequence by the diffusion head.  Default
+        **1**; the shipped config uses 32, which builds a structural
+        ensemble.  For pLDDT scoring the scores are averaged anyway, so
+        extra samples cost time and memory (pair tensors are ~L^2 each)
+        without changing the ranking.  ``None`` uses the config default.
+        Silently ignored if this build of `esm` does not accept it.
+    empty_cache_every:
+        Release cached accelerator memory every N sequences.  Default
+        **1** (after each).  Prevents allocator fragmentation across long
+        batches, which on Aurora XPU manifests as a GPU page fault.  Set
+        to ``0`` to disable if you are memory-comfortable and want the
+        last few percent of throughput.
     compile_model:
         If ``True``, run ``torch.compile()`` on the model after loading.
         Adds ~30–60 s startup cost but can improve throughput for many
@@ -108,12 +121,20 @@ class StructureScorer:
         esmc_model_id: str | None = None,
         num_sampling_steps: int = 10,
         num_loops: int = 1,
+        num_diffusion_samples: int | None = 1,
+        empty_cache_every: int = 1,
         compile_model: bool = False,
     ) -> None:
         self.device = resolve_device(device)
         self.dtype = dtype or optimal_dtype(self.device)
         self.num_sampling_steps = num_sampling_steps
         self.num_loops = num_loops
+        self.num_diffusion_samples = num_diffusion_samples
+        self.empty_cache_every = empty_cache_every
+
+        # Set False after the first TypeError so we stop retrying a kwarg
+        # this build of `esm` does not accept.
+        self._supports_diffusion_samples = num_diffusion_samples is not None
 
         log.info(
             "Loading ESMFold2-Fast from %s (device=%s, dtype=%s)",
@@ -240,15 +261,18 @@ class StructureScorer:
         per_seq_ptm: list[float] = []
         lengths: list[int] = []
 
-        for seq in sequences:
-            output = self._model.infer_protein(
-                seq,
-                num_loops=loops,
-                num_sampling_steps=steps,
-            )
+        for i, seq in enumerate(sequences):
+            output = self._infer(seq, loops=loops, steps=steps)
             per_seq_plddt.append(float(output["plddt"].mean()))
             per_seq_ptm.append(float(output["ptm"].mean()))
             lengths.append(len(seq))
+
+            # Structure prediction allocates large transient pair tensors
+            # (~L^2 per diffusion sample). Without releasing them the XPU
+            # caching allocator fragments across a long batch and faults.
+            del output
+            if self.empty_cache_every and (i + 1) % self.empty_cache_every == 0:
+                _empty_cache(self.device)
 
         elapsed = time.monotonic() - t0
         mean_plddt = sum(per_seq_plddt) / len(per_seq_plddt)
@@ -268,11 +292,59 @@ class StructureScorer:
             per_sequence_lengths=lengths,
         )
 
+    def _infer(self, seq: str, *, loops: int, steps: int) -> dict:
+        """Run one structure prediction, adapting to this build's kwargs.
+
+        ``num_diffusion_samples`` controls how many structures the
+        diffusion head samples.  The shipped config uses 32, which is
+        useful for generating structural ensembles but wasteful for
+        scoring — pLDDT is averaged anyway, and peak memory scales with
+        it (pair tensors are ~L^2 per sample).  Not every build of `esm`
+        exposes it as a forward kwarg, so it is tried once and dropped
+        permanently if rejected.
+        """
+        kwargs = {"num_loops": loops, "num_sampling_steps": steps}
+
+        if self._supports_diffusion_samples:
+            try:
+                return self._model.infer_protein(
+                    seq,
+                    num_diffusion_samples=self.num_diffusion_samples,
+                    **kwargs,
+                )
+            except TypeError as exc:
+                self._supports_diffusion_samples = False
+                log.warning(
+                    "infer_protein() rejected num_diffusion_samples (%s); "
+                    "falling back to the config default. Peak memory will be "
+                    "higher on long sequences.",
+                    exc,
+                )
+
+        return self._model.infer_protein(seq, **kwargs)
+
     @staticmethod
     def _sanitize(seq: str) -> str:
         """Normalize a sequence: uppercase, strip whitespace, replace unknowns."""
         seq = "".join(seq.upper().split())
         return "".join(c if c in VALID_AA else "X" for c in seq)
+
+
+def _empty_cache(device: torch.device) -> None:
+    """Release cached allocator blocks on *device* (no-op on CPU)."""
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def peak_memory_gb(device: torch.device) -> float:
+    """Peak allocator memory in GiB since the last reset (0.0 on CPU)."""
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        return torch.xpu.max_memory_allocated() / 1024**3
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024**3
+    return 0.0
 
 
 def _patch_linalg_cpu_roundtrip() -> None:

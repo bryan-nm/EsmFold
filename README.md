@@ -167,6 +167,8 @@ def evaluate_generated_sequences(sequences: list[str]) -> dict:
 | `esmc_model_id`       | `None`                     | Hub repo ID for ESM-C backbone. `None` uses config default.           |
 | `num_sampling_steps`  | `10`                       | Diffusion steps. Lower = faster. Paper default: 50.                   |
 | `num_loops`           | `1`                        | Trunk recycling loops. Lower = faster. Paper default: 3.              |
+| `num_diffusion_samples` | `1`                      | Structures sampled per sequence. Config default 32. Drives peak memory. |
+| `empty_cache_every`   | `1`                        | Release cached device memory every N sequences. `0` disables.         |
 | `compile_model`       | `False`                    | Run `torch.compile()`. Slow startup, faster steady-state throughput.  |
 
 ### ScoringResult fields
@@ -283,9 +285,13 @@ EsmFold/
 **Short sequences (< 100 residues):** `torch.compile()` amortizes well.
 Pass `compile_model=True` if you're scoring hundreds of short peptides.
 
-**Long sequences (> 500 residues):** Memory dominates.  Keep
-`num_sampling_steps` low and consider `dtype=torch.float16` on CUDA if
-bf16 causes OOM.
+**Long sequences (> 500 residues):** Memory dominates, and it scales as
+roughly `num_diffusion_samples × L²`.  Keep `num_diffusion_samples=1`
+(the default here, vs. 32 in the shipped config) and `num_sampling_steps`
+low.  On CUDA, `dtype=torch.float16` is an option if bf16 causes OOM.
+If you see a GPU page fault rather than a clean OOM on XPU, that is the
+allocator fragmenting — lower `empty_cache_every` or drop the sample
+count before assuming the sequence is too long.
 
 **Very large batches:** Sequences are scored one at a time (ESMFold2's
 `infer_protein` is single-sequence).  Throughput scales linearly with

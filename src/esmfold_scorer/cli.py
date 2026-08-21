@@ -96,6 +96,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Folding trunk recycling loops (default: 1, paper default: 3).",
     )
     parser.add_argument(
+        "--diffusion-samples",
+        type=int,
+        default=1,
+        help="Structures sampled per sequence (default: 1, config default: 32). "
+             "More samples cost time and memory without changing pLDDT ranking.",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Run torch.compile() on the model (slow startup, faster throughput).",
@@ -146,6 +153,7 @@ def main(argv: list[str] | None = None) -> None:
         esmc_model_id=args.esmc_id,
         num_sampling_steps=args.steps,
         num_loops=args.loops,
+        num_diffusion_samples=args.diffusion_samples,
         compile_model=args.compile,
     )
     results = scorer.score(sequences)

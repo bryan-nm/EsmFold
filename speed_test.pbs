@@ -114,7 +114,10 @@ print(f"Loaded {len(sequences)} sequences "
       f"({min(len(s) for s in sequences)}-{max(len(s) for s in sequences)} aa)\n")
 
 # --- load model once ---
+import inspect
+import torch
 from esmfold_scorer import StructureScorer
+from esmfold_scorer.scorer import peak_memory_gb
 
 t_load = time.monotonic()
 scorer = StructureScorer(
@@ -122,18 +125,39 @@ scorer = StructureScorer(
     device="xpu",
 )
 t_load = time.monotonic() - t_load
-print(f"Model loaded in {t_load:.1f} s\n")
+print(f"Model loaded in {t_load:.1f} s")
+print(f"Weights resident: {peak_memory_gb(scorer.device):.1f} GiB\n")
 
-# --- smoke test: one short sequence, minimal steps ---
-# Fails fast (seconds) if the XPU path is broken, instead of after the
-# full sweep. Uses the shortest sequence to minimise memory pressure.
-shortest = min(sequences, key=len)
-print(f"[smoke] scoring 1 sequence ({len(shortest)} aa, 2 steps, 1 loop)...",
-      flush=True)
-t_smoke = time.monotonic()
-smoke = scorer.score([shortest], num_sampling_steps=2, num_loops=1)
-print(f"[smoke] OK — pLDDT {smoke.mean_plddt:.2f} "
-      f"in {time.monotonic() - t_smoke:.1f} s\n", flush=True)
+# --- diagnostic: what kwargs does this build of esm accept? ---
+try:
+    print(f"infer_protein{inspect.signature(scorer._model.infer_protein)}\n")
+except (TypeError, ValueError) as exc:
+    print(f"(could not introspect infer_protein: {exc})\n")
+
+
+def probe(label, seq, steps, loops):
+    """Score one sequence, reporting time, pLDDT range and peak memory."""
+    torch.xpu.reset_peak_memory_stats()
+    print(f"[{label}] {len(seq)} aa, {steps} steps, {loops} loop(s)...",
+          end=" ", flush=True)
+    t = time.monotonic()
+    r = scorer.score([seq], num_sampling_steps=steps, num_loops=loops)
+    print(f"OK  pLDDT={r.mean_plddt:.4f}  pTM={r.per_sequence_ptm[0]:.4f}  "
+          f"{time.monotonic() - t:.1f}s  peak={peak_memory_gb(scorer.device):.1f} GiB",
+          flush=True)
+    return r
+
+
+# --- staged smoke tests, cheapest first ---
+# The full sweep crashed after the short-sequence smoke test passed, so
+# probe the memory worst case (longest sequence at the heaviest config)
+# BEFORE committing to 100 sequences. Each stage fails fast and tells us
+# where the ceiling is instead of aborting mid-sweep.
+by_len = sorted(sequences, key=len)
+probe("smoke:short", by_len[0], 2, 1)
+probe("smoke:long", by_len[-1], 2, 1)
+probe("smoke:long-heavy", by_len[-1], 50, 3)
+print()
 
 # --- sweep configs ---
 configs = [
@@ -141,14 +165,16 @@ configs = [
     (5, 3), (10, 3), (20, 3), (50, 3),
 ]
 
-print(f"{'steps':>5}  {'loops':>5}  {'pLDDT':>7}  {'time (s)':>9}  {'seq/s':>7}  {'s/seq':>7}")
-print("-" * 55)
+print(f"{'steps':>5}  {'loops':>5}  {'pLDDT':>8}  {'time (s)':>9}  {'seq/s':>7}  {'s/seq':>7}  {'peak GiB':>8}")
+print("-" * 68)
 
 for steps, loops in configs:
+    torch.xpu.reset_peak_memory_stats()
     result = scorer.score(sequences, num_sampling_steps=steps, num_loops=loops)
-    n = result.num_sequences
-    t = result.elapsed_seconds
-    print(f"{steps:>5}  {loops:>5}  {result.mean_plddt:>7.2f}  {t:>9.1f}  {n/t:>7.2f}  {t/n:>7.2f}")
+    n, t = result.num_sequences, result.elapsed_seconds
+    print(f"{steps:>5}  {loops:>5}  {result.mean_plddt:>8.4f}  {t:>9.1f}  "
+          f"{n/t:>7.2f}  {t/n:>7.2f}  {peak_memory_gb(scorer.device):>8.1f}",
+          flush=True)
 
 print()
 PYEOF
